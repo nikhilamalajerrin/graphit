@@ -1,0 +1,55 @@
+
+from dataclasses import dataclass, field
+
+from ..core.primitives import Error
+
+############################################################################
+
+# LLM text completion
+
+@dataclass
+class TextCompletionRequest:
+    system: str = ""
+    prompt: str = ""
+    streaming: bool = False  # Default false for backward compatibility
+
+@dataclass
+class TextCompletionResponse:
+    error: Error | None = None
+    response: str = ""
+    in_token: int | None = None
+    out_token: int | None = None
+    model: str | None = None
+    end_of_stream: bool = False  # Indicates final message in stream
+
+############################################################################
+
+# Embeddings
+
+@dataclass
+class EmbeddingsRequest:
+    texts: list[str] = field(default_factory=list)
+
+@dataclass
+class EmbeddingsResponse:
+    error: Error | None = None
+    vectors: list[list[float]] = field(default_factory=list)
+
+############################################################################
+
+# Tool request/response
+
+@dataclass
+class ToolRequest:
+    name: str = ""
+    # Parameters are JSON encoded
+    parameters: str = ""
+
+@dataclass
+class ToolResponse:
+    error: Error | None = None
+    # Plain text aka "unstructured"
+    text: str = ""
+    # JSON-encoded object aka "structured"
+    object: str = ""
+

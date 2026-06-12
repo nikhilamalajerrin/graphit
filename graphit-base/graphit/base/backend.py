@@ -1,0 +1,216 @@
+"""
+Backend abstraction interfaces for pub/sub systems.
+
+This module defines Protocol classes that all pub/sub backends must implement,
+allowing GraphIt to work with different messaging systems (Pulsar, MQTT, Kafka, etc.)
+"""
+
+from typing import Protocol, Any, runtime_checkable
+
+
+@runtime_checkable
+class Message(Protocol):
+    """Protocol for a received message."""
+
+    def value(self) -> Any:
+        """
+        Get the deserialized message content.
+
+        Returns:
+            Dataclass instance representing the message
+        """
+        ...
+
+    def properties(self) -> dict:
+        """
+        Get message properties/metadata.
+
+        Returns:
+            Dictionary of message properties
+        """
+        ...
+
+
+@runtime_checkable
+class BackendProducer(Protocol):
+    """Protocol for backend-specific producer."""
+
+    def send(self, message: Any, properties: dict = {}) -> None:
+        """
+        Send a message (dataclass instance) with optional properties.
+
+        Args:
+            message: Dataclass instance to send
+            properties: Optional metadata properties
+        """
+        ...
+
+    def flush(self) -> None:
+        """Flush any buffered messages."""
+        ...
+
+    def close(self) -> None:
+        """Close the producer."""
+        ...
+
+
+@runtime_checkable
+class BackendConsumer(Protocol):
+    """Protocol for backend-specific consumer."""
+
+    def ensure_connected(self) -> None:
+        """
+        Eagerly establish the underlying connection and bind the queue.
+
+        Backends that lazily connect on first receive() must implement this
+        so that callers can guarantee the consumer is fully bound — and
+        therefore able to receive responses — before any related request is
+        published. Backends that connect at construction time may make this
+        a no-op.
+        """
+        ...
+
+    def receive(self, timeout_millis: int = 2000) -> Message:
+        """
+        Receive a message from the topic.
+
+        Args:
+            timeout_millis: Timeout in milliseconds
+
+        Returns:
+            Message object
+
+        Raises:
+            TimeoutError: If no message received within timeout
+        """
+        ...
+
+    def acknowledge(self, message: Message) -> None:
+        """
+        Acknowledge successful processing of a message.
+
+        Args:
+            message: The message to acknowledge
+        """
+        ...
+
+    def negative_acknowledge(self, message: Message) -> None:
+        """
+        Negative acknowledge - triggers redelivery.
+
+        Args:
+            message: The message to negatively acknowledge
+        """
+        ...
+
+    def unsubscribe(self) -> None:
+        """Unsubscribe from the topic."""
+        ...
+
+    def close(self) -> None:
+        """Close the consumer."""
+        ...
+
+
+@runtime_checkable
+class PubSubBackend(Protocol):
+    """Protocol defining the interface all pub/sub backends must implement."""
+
+    def create_producer(self, topic: str, schema: type, **options) -> BackendProducer:
+        """
+        Create a producer for a topic.
+
+        Args:
+            topic: Queue identifier in class:topicspace:topic format
+            schema: Dataclass type for messages
+            **options: Backend-specific options (e.g., chunking_enabled)
+
+        Returns:
+            Backend-specific producer instance
+        """
+        ...
+
+    def create_consumer(
+        self,
+        topic: str,
+        subscription: str,
+        schema: type,
+        initial_position: str = 'latest',
+        **options
+    ) -> BackendConsumer:
+        """
+        Create a consumer for a topic.
+
+        Consumer behaviour is determined by the topic's class prefix:
+          - flow: shared competing consumers, durable named queue
+          - request: shared competing consumers, non-durable named queue
+          - response: exclusive per-subscriber, anonymous auto-delete queue
+          - notify: exclusive per-subscriber, anonymous auto-delete queue
+
+        Args:
+            topic: Queue identifier in class:topicspace:topic format
+            subscription: Subscription/consumer group name
+            schema: Dataclass type for messages
+            initial_position: 'earliest' or 'latest' (some backends may ignore)
+            **options: Backend-specific options
+
+        Returns:
+            Backend-specific consumer instance
+        """
+        ...
+
+    async def create_topic(self, topic: str) -> None:
+        """
+        Create the broker-side resources for a logical topic.
+
+        For RabbitMQ this creates a fanout exchange.  For Pulsar this is
+        a no-op (topics auto-create on first use).
+
+        Idempotent — creating an already-existing topic succeeds silently.
+
+        Args:
+            topic: Topic identifier in class:topicspace:topic format
+        """
+        ...
+
+    async def delete_topic(self, topic: str) -> None:
+        """
+        Delete a topic and discard any in-flight messages.
+
+        For RabbitMQ this deletes the fanout exchange; consumer queues
+        lose their binding and drain naturally.
+
+        Idempotent — deleting a non-existent topic succeeds silently.
+
+        Args:
+            topic: Topic identifier in class:topicspace:topic format
+        """
+        ...
+
+    async def topic_exists(self, topic: str) -> bool:
+        """
+        Check whether a topic exists.
+
+        Args:
+            topic: Topic identifier in class:topicspace:topic format
+
+        Returns:
+            True if the topic exists, False otherwise.
+        """
+        ...
+
+    async def ensure_topic(self, topic: str) -> None:
+        """
+        Ensure a topic exists, creating it if necessary.
+
+        Convenience wrapper — checks existence, creates if missing.
+        Used by the flow service and system services on startup.
+
+        Args:
+            topic: Topic identifier in class:topicspace:topic format
+        """
+        ...
+
+    def close(self) -> None:
+        """Close the backend connection."""
+        ...

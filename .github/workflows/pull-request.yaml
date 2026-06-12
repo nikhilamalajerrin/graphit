@@ -1,0 +1,62 @@
+
+name: Test pull request
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+
+  test:
+
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    container:
+      image: python:3.13
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup packages
+        run: make update-package-versions VERSION=2.5.999
+
+      - name: Setup environment
+        run: python3 -m venv env
+
+      - name: Invoke environment
+        run: . env/bin/activate
+
+      - name: Install graphit-base
+        run: (cd graphit-base; pip install .)
+
+      - name: Install graphit-cli
+        run: (cd graphit-cli; pip install .)
+
+      - name: Install graphit-flow
+        run: (cd graphit-flow; pip install .)
+
+      - name: Install graphit-unstructured
+        run: (cd graphit-unstructured; pip install .)
+
+      - name: Install graphit-vertexai
+        run: (cd graphit-vertexai; pip install .)
+
+      - name: Install graphit-bedrock
+        run: (cd graphit-bedrock; pip install .)
+
+      - name: Install some stuff
+        run: pip install pytest pytest-cov pytest-asyncio pytest-mock
+
+      - name: Unit tests
+        run: pytest tests/unit
+
+      - name: Integration tests (cut the out the long-running tests)
+        run: pytest tests/integration -m 'not slow'
+
+      - name: Contract tests
+        run: pytest tests/contract
+

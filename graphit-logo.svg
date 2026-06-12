@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="150" viewBox="0 0 450 112.5" version="1.1">
+  <defs>
+    <linearGradient id="gi-node-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#14b8a6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Icon: small connected graph -->
+  <g stroke="url(#gi-node-grad)" stroke-width="3" fill="none" stroke-linecap="round">
+    <line x1="22" y1="56" x2="50" y2="30"/>
+    <line x1="22" y1="56" x2="50" y2="82"/>
+    <line x1="50" y1="30" x2="84" y2="40"/>
+    <line x1="50" y1="82" x2="84" y2="72"/>
+    <line x1="84" y1="40" x2="84" y2="72"/>
+  </g>
+  <g fill="url(#gi-node-grad)">
+    <circle cx="22" cy="56" r="9"/>
+    <circle cx="50" cy="30" r="7"/>
+    <circle cx="50" cy="82" r="7"/>
+    <circle cx="84" cy="40" r="6"/>
+    <circle cx="84" cy="72" r="6"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="108" y="78" font-family="Helvetica, Arial, sans-serif" font-size="52" font-weight="700" fill="#1e1b3a">Graph<tspan fill="#14b8a6">It</tspan></text>
+</svg>

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphit"
+dynamic = ["version"]
+authors = [{name = "graphit.ai", email = "security@graphit.ai"}]
+description = "GraphIt provides a means to run a pipeline of flexible AI processing components in a flexible means to achieve a processing pipeline."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "graphit-base>=2.5,<2.6",
+    "graphit-bedrock>=2.5,<2.6",
+    "graphit-cli>=2.5,<2.6",
+    "graphit-embeddings-hf>=2.5,<2.6",
+    "graphit-flow>=2.5,<2.6",
+    "graphit-unstructured>=2.5,<2.6",
+    "graphit-vertexai>=2.5,<2.6",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/graphit-ai/graphit"
+
+[tool.setuptools]
+packages = ["graphit"]
+
+[tool.setuptools.dynamic]
+version = {attr = "graphit.graphit_version.__version__"}
