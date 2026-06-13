@@ -1,0 +1,395 @@
+
+import logging
+import json
+import re
+import asyncio
+import time
+
+from . types import Action, Final
+
+logger = logging.getLogger(__name__)
+
+class AgentManager:
+
+    def __init__(self, tools, additional_context=None):
+        self.tools = tools
+        self.additional_context = additional_context
+
+    def parse_react_response(self, text):
+        """Parse text-based ReAct response format.
+
+        Expected format:
+        Thought: [reasoning about what to do next]
+        Action: [tool_name]
+        Args: {
+            "param": "value"
+        }
+
+        OR
+
+        Thought: [reasoning about the final answer]
+        Final Answer: [the answer]
+        """
+        if not isinstance(text, str):
+            raise ValueError(f"Expected string response, got {type(text)}")
+
+        # Remove any markdown code blocks that might wrap the response
+        text = re.sub(r'^```[^\n]*\n', '', text.strip())
+        text = re.sub(r'\n```$', '', text.strip())
+
+        lines = text.strip().split('\n')
+
+        thought = None
+        action = None
+        args = None
+        final_answer = None
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            # Parse Thought
+            if line.startswith("Thought:"):
+                thought = line[8:].strip()
+                # Handle multi-line thoughts
+                i += 1
+                while i < len(lines):
+                    next_line = lines[i].strip()
+                    if next_line.startswith(("Action:", "Final Answer:", "Args:")):
+                        break
+                    thought += " " + next_line
+                    i += 1
+                continue
+
+            # Parse Final Answer
+            if line.startswith("Final Answer:"):
+                final_answer = line[13:].strip()
+                # Handle multi-line final answers (including JSON)
+                i += 1
+
+                # Check if the answer might be JSON
+                if final_answer.startswith('{') or (i < len(lines) and lines[i].strip().startswith('{')):
+                    # Collect potential JSON answer
+                    json_text = final_answer if final_answer.startswith('{') else ""
+                    brace_count = json_text.count('{') - json_text.count('}')
+
+                    while i < len(lines) and (brace_count > 0 or not json_text):
+                        current_line = lines[i].strip()
+                        if current_line.startswith(("Thought:", "Action:")) and brace_count == 0:
+                            break
+                        json_text += ("\n" if json_text else "") + current_line
+                        brace_count += current_line.count('{') - current_line.count('}')
+                        i += 1
+
+                    # Try to parse as JSON
+                    # try:
+                    #     final_answer = json.loads(json_text)
+                    # except json.JSONDecodeError:
+                    #     # Not valid JSON, treat as regular text
+                    #     final_answer = json_text
+                    final_answer = json_text
+                else:
+                    # Regular text answer
+                    while i < len(lines):
+                        next_line = lines[i].strip()
+                        if next_line.startswith(("Thought:", "Action:")):
+                            break
+                        final_answer += " " + next_line
+                        i += 1
+
+                # If we have a final answer, return Final object
+                return Final(
+                    thought=thought or "",
+                    final=final_answer
+                )
+
+            # Parse Action
+            if line.startswith("Action:"):
+                action = line[7:].strip()
+
+                # Get rid of quotation prefix/suffix if present
+                while action and action[0] == '"':
+                    action = action[1:]
+
+                while action and action[-1] == '"':
+                    action = action[:-1]
+
+            # Parse Args
+            if line.startswith("Args:"):
+                # Check if JSON starts on the same line
+                args_on_same_line = line[5:].strip()
+                if args_on_same_line:
+                    args_text = args_on_same_line
+                    brace_count = args_on_same_line.count('{') - args_on_same_line.count('}')
+                else:
+                    args_text = ""
+                    brace_count = 0
+
+                # Collect all lines that form the JSON arguments
+                i += 1
+                started = bool(args_on_same_line and '{' in args_on_same_line)
+
+                while i < len(lines) and (not started or brace_count > 0):
+                    current_line = lines[i]
+                    args_text += ("\n" if args_text else "") + current_line
+
+                    # Count braces to determine when JSON is complete
+                    for char in current_line:
+                        if char == '{':
+                            brace_count += 1
+                            started = True
+                        elif char == '}':
+                            brace_count -= 1
+
+                    # If we've started and braces are balanced, we're done
+                    if started and brace_count == 0:
+                        break
+
+                    i += 1
+
+                # Parse the JSON arguments
+                try:
+                    args = json.loads(args_text.strip())
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON arguments: {args_text}")
+                    raise ValueError(f"Invalid JSON in Args: {e}")
+
+            i += 1
+
+        # If we have an action, return Action object
+        if action:
+            return Action(
+                thought=thought or "",
+                name=action,
+                arguments=args or {},
+                observation=""
+            )
+
+        # If we only have a thought but no action or final answer
+        if thought and not action and not final_answer:
+            raise ValueError(f"Response has thought but no action or final answer: {text}")
+
+        raise ValueError(f"Could not parse response: {text}")
+
+    async def reason(self, question, history, context, streaming=False, think=None, observe=None, answer=None, usage=None):
+
+        logger.debug(f"calling reason: {question}")
+
+        tools = self.tools
+
+        tool_names = ",".join([
+            t for t in self.tools.keys()
+        ])
+
+        variables = {
+            "question": question,
+            "tools": [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "arguments": [
+                        {
+                            "name": arg.name,
+                            "type": arg.type,
+                            "description": arg.description
+                        }
+                        for arg in tool.arguments
+                    ]
+                }
+                for tool in self.tools.values()
+            ],
+            "context": self.additional_context,
+            "question": question,
+            "tool_names": tool_names,
+            "history": [
+                {
+                    "thought": h.thought,
+                    "action": h.name,
+                    "arguments": h.arguments,
+                    "observation": h.observation,
+                }
+                for h in history
+            ]
+        }
+
+        logger.debug(f"Variables: {json.dumps(variables, indent=4)}")
+
+        # Streaming path - use StreamingReActParser
+        if streaming and think:
+            from .streaming_parser import StreamingReActParser
+
+            # Collect chunks to send via async callbacks
+            thought_chunks = []
+            answer_chunks = []
+
+            # Create parser with synchronous callbacks that just collect chunks
+            parser = StreamingReActParser(
+                on_thought_chunk=lambda chunk: thought_chunks.append(chunk),
+                on_answer_chunk=lambda chunk: answer_chunks.append(chunk),
+            )
+
+            # Create async chunk callback that feeds parser and sends collected chunks
+            async def on_chunk(text, end_of_stream):
+
+                # Track what we had before
+                prev_thought_count = len(thought_chunks)
+                prev_answer_count = len(answer_chunks)
+
+                # Feed the parser (synchronous)
+                parser.feed(text)
+
+                # Send any new thought chunks
+                for i in range(prev_thought_count, len(thought_chunks)):
+                    # Mark last chunk as final if parser has moved out of THOUGHT state
+                    is_last = (i == len(thought_chunks) - 1)
+                    is_thought_complete = parser.state.value != "thought"
+                    is_final = is_last and is_thought_complete
+                    await think(thought_chunks[i], is_final=is_final)
+
+                # Send any new answer chunks
+                for i in range(prev_answer_count, len(answer_chunks)):
+                    if answer:
+                        await answer(answer_chunks[i])
+                    else:
+                        await think(answer_chunks[i])
+
+            client = context("prompt-request")
+
+            # Get streaming response
+            prompt_result = await client.agent_react(
+                variables=variables,
+                streaming=True,
+                chunk_callback=on_chunk
+            )
+            self._last_prompt_result = prompt_result
+            if usage:
+                usage.track(prompt_result)
+
+            # Finalize parser
+            parser.finalize()
+
+            # Get result
+            result = parser.get_result()
+            if result is None:
+                return Action(
+                    thought="",
+                    name="__parse_error__",
+                    arguments={},
+                    observation="",
+                    tool_error="LLM response could not be parsed (streaming)",
+                )
+
+            return result
+
+        else:
+            # Non-streaming path - get complete text and parse
+            client = context("prompt-request")
+
+            prompt_result = await client.agent_react(
+                variables=variables,
+                streaming=False
+            )
+            self._last_prompt_result = prompt_result
+            if usage:
+                usage.track(prompt_result)
+            response_text = prompt_result.text
+
+            logger.debug(f"Response text:\n{response_text}")
+
+            # Parse the text response
+            try:
+                result = self.parse_react_response(response_text)
+                return result
+            except ValueError as e:
+                logger.error(f"Failed to parse response: {e}")
+                logger.error(f"Response was: {response_text}")
+                return Action(
+                    thought="",
+                    name="__parse_error__",
+                    arguments={},
+                    observation="",
+                    tool_error=f"LLM parse error: {e}",
+                )
+
+    async def react(self, question, history, think, observe, context,
+                    streaming=False, answer=None, on_action=None,
+                    usage=None):
+
+        t0 = time.monotonic()
+        act = await self.reason(
+            question = question,
+            history = history,
+            context = context,
+            streaming = streaming,
+            think = think,
+            observe = observe,
+            answer = answer,
+            usage = usage,
+        )
+        act.llm_duration_ms = int((time.monotonic() - t0) * 1000)
+        pr = getattr(self, '_last_prompt_result', None)
+        if pr:
+            act.in_token = pr.in_token
+            act.out_token = pr.out_token
+            act.llm_model = pr.model
+
+        if isinstance(act, Final):
+
+            # In non-streaming mode, send complete thought
+            # In streaming mode, thoughts were already sent as chunks
+            if not streaming:
+                await think(act.thought, is_final=True)
+            return act
+
+        else:
+
+            # In non-streaming mode, send complete thought
+            # In streaming mode, thoughts were already sent as chunks
+            if not streaming:
+                await think(act.thought, is_final=True)
+
+            logger.debug(f"ACTION: {act.name}")
+
+            # Notify caller before tool execution (for provenance)
+            if on_action:
+                await on_action(act)
+
+            # Handle parse errors — skip tool execution
+            if act.name == "__parse_error__":
+                resp = f"Error: {act.tool_error}"
+                act.tool_duration_ms = 0
+                await observe(resp, is_final=True)
+                act.observation = resp
+                return act
+
+            if act.name in self.tools:
+                action = self.tools[act.name]
+            else:
+                raise RuntimeError(f"No action for {act.name}!")
+
+            t0 = time.monotonic()
+            try:
+                resp = await action.implementation(context).invoke(
+                    **act.arguments
+                )
+
+                if isinstance(resp, str):
+                    resp = resp.strip()
+                else:
+                    resp = str(resp)
+                    resp = resp.strip()
+
+                act.tool_error = None
+
+            except Exception as e:
+                logger.error(f"Tool execution error ({act.name}): {e}")
+                resp = f"Error: {e}"
+                act.tool_error = str(e)
+
+            act.tool_duration_ms = int((time.monotonic() - t0) * 1000)
+
+            await observe(resp, is_final=True)
+
+            act.observation = resp
+
+            return act

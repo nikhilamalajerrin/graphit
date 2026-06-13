@@ -1,0 +1,142 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphit-flow"
+dynamic = ["version"]
+authors = [{name = "graphit.ai", email = "security@graphit.ai"}]
+description = "GraphIt provides a means to run a pipeline of flexible AI processing components in a flexible means to achieve a processing pipeline."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "graphit-base>=2.5,<2.6",
+    "aiohttp",
+    "anthropic",
+    "scylla-driver",
+    "cohere",
+    "cryptography",
+    "faiss-cpu",
+    "falkordb",
+    "fastembed",
+    "ibis",
+    "jsonschema",
+    "langchain",
+    "langchain-community",
+    "langchain-core",
+    "langchain-text-splitters",
+    "mcp",
+    "minio",
+    "mistralai<2.0.0",
+    "neo4j",
+    "nltk",
+    "ollama",
+    "openai",
+    "pinecone[grpc]",
+    "prometheus-client",
+    "pulsar-client",
+    "pymilvus",
+    "pypdf",
+    "pyyaml",
+    "qdrant-client",
+    "rdflib",
+    "requests",
+    "snowflake-connector-python",
+    "strawberry-graphql",
+    "tabulate",
+    "tiktoken",
+    "urllib3",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/graphit-ai/graphit"
+
+[project.scripts]
+agent-manager-react = "graphit.agent.react:run"
+agent-orchestrator = "graphit.agent.orchestrator:run"
+api-gateway = "graphit.gateway:run"
+chunker-recursive = "graphit.chunking.recursive:run"
+chunker-token = "graphit.chunking.token:run"
+bootstrap = "graphit.bootstrap.bootstrapper:run"
+config-svc = "graphit.config.service:run"
+flow-svc = "graphit.flow.service:run"
+iam-svc = "graphit.iam.service:run"
+no-auth-svc = "graphit.iam.noauth:run"
+doc-embeddings-query-milvus = "graphit.query.doc_embeddings.milvus:run"
+doc-embeddings-query-pinecone = "graphit.query.doc_embeddings.pinecone:run"
+doc-embeddings-query-qdrant = "graphit.query.doc_embeddings.qdrant:run"
+doc-embeddings-write-milvus = "graphit.storage.doc_embeddings.milvus:run"
+doc-embeddings-write-pinecone = "graphit.storage.doc_embeddings.pinecone:run"
+doc-embeddings-write-qdrant = "graphit.storage.doc_embeddings.qdrant:run"
+document-embeddings = "graphit.embeddings.document_embeddings:run"
+document-rag = "graphit.retrieval.document_rag:run"
+embeddings-fastembed = "graphit.embeddings.fastembed:run"
+embeddings-ollama = "graphit.embeddings.ollama:run"
+graph-embeddings-query-milvus = "graphit.query.graph_embeddings.milvus:run"
+graph-embeddings-query-pinecone = "graphit.query.graph_embeddings.pinecone:run"
+graph-embeddings-query-qdrant = "graphit.query.graph_embeddings.qdrant:run"
+graph-embeddings-write-milvus = "graphit.storage.graph_embeddings.milvus:run"
+graph-embeddings-write-pinecone = "graphit.storage.graph_embeddings.pinecone:run"
+graph-embeddings-write-qdrant = "graphit.storage.graph_embeddings.qdrant:run"
+graph-embeddings = "graphit.embeddings.graph_embeddings:run"
+graph-rag = "graphit.retrieval.graph_rag:run"
+kg-extract-agent = "graphit.extract.kg.agent:run"
+kg-extract-definitions = "graphit.extract.kg.definitions:run"
+kg-extract-rows = "graphit.extract.kg.rows:run"
+kg-extract-relationships = "graphit.extract.kg.relationships:run"
+kg-extract-topics = "graphit.extract.kg.topics:run"
+kg-extract-ontology = "graphit.extract.kg.ontology:run"
+kg-manager = "graphit.cores:run"
+kg-store = "graphit.storage.knowledge:run"
+librarian = "graphit.librarian:run"
+mcp-tool = "graphit.agent.mcp_tool:run"
+metering = "graphit.metering:run"
+nlp-query = "graphit.retrieval.nlp_query:run"
+rows-write-cassandra = "graphit.storage.rows.cassandra:run"
+rows-query-cassandra = "graphit.query.rows.cassandra:run"
+row-embeddings = "graphit.embeddings.row_embeddings:run"
+row-embeddings-write-qdrant = "graphit.storage.row_embeddings.qdrant:run"
+row-embeddings-query-qdrant = "graphit.query.row_embeddings.qdrant:run"
+obsidian-decoder = "graphit.decoding.obsidian:run"
+pdf-decoder = "graphit.decoding.pdf:run"
+pdf-ocr-mistral = "graphit.decoding.mistral_ocr:run"
+prompt-template = "graphit.prompt.template:run"
+rev-gateway = "graphit.rev_gateway:run"
+run-processing = "graphit.processing:run"
+sparql-query = "graphit.query.sparql:run"
+structured-query = "graphit.retrieval.structured_query:run"
+structured-diag = "graphit.retrieval.structured_diag:run"
+text-completion-azure = "graphit.model.text_completion.azure:run"
+text-completion-azure-openai = "graphit.model.text_completion.azure_openai:run"
+text-completion-claude = "graphit.model.text_completion.claude:run"
+text-completion-cohere = "graphit.model.text_completion.cohere:run"
+text-completion-cortex = "graphit.model.text_completion.cortex:run"
+text-completion-llamafile = "graphit.model.text_completion.llamafile:run"
+text-completion-lmstudio = "graphit.model.text_completion.lmstudio:run"
+text-completion-mistral = "graphit.model.text_completion.mistral:run"
+text-completion-ollama = "graphit.model.text_completion.ollama:run"
+text-completion-openai = "graphit.model.text_completion.openai:run"
+text-completion-tgi = "graphit.model.text_completion.tgi:run"
+text-completion-vllm = "graphit.model.text_completion.vllm:run"
+triples-query-cassandra = "graphit.query.triples.cassandra:run"
+triples-query-falkordb = "graphit.query.triples.falkordb:run"
+triples-query-memgraph = "graphit.query.triples.memgraph:run"
+triples-query-neo4j = "graphit.query.triples.neo4j:run"
+triples-query-snowflake = "graphit.query.triples.snowflake:run"
+triples-write-cassandra = "graphit.storage.triples.cassandra:run"
+triples-write-falkordb = "graphit.storage.triples.falkordb:run"
+triples-write-memgraph = "graphit.storage.triples.memgraph:run"
+triples-write-neo4j = "graphit.storage.triples.neo4j:run"
+triples-write-snowflake = "graphit.storage.triples.snowflake:run"
+wikipedia-lookup = "graphit.external.wikipedia:run"
+joke-service = "graphit.tool_service.joke:run"
+
+[tool.setuptools.packages.find]
+include = ["graphit*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "graphit.flow_version.__version__"}

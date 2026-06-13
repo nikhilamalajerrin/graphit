@@ -1,0 +1,713 @@
+"""
+SPARQL FILTER expression evaluator.
+
+Evaluates rdflib algebra expression nodes against a solution (variable
+binding) to produce a value or boolean result.
+"""
+
+import hashlib
+import math
+import random
+import re
+import logging
+import operator
+import uuid
+from datetime import datetime, date, timezone
+from urllib.parse import quote
+
+from rdflib.term import Variable, URIRef, Literal, BNode
+from rdflib.plugins.sparql.parserutils import CompValue
+
+from ... schema import Term, IRI, LITERAL, BLANK
+from . parser import rdflib_term_to_term
+
+logger = logging.getLogger(__name__)
+
+_exists_callback = None
+
+
+class ExpressionError(Exception):
+    """Raised when a SPARQL expression cannot be evaluated."""
+    pass
+
+
+def evaluate_expression(expr, solution, exists_cb=None):
+    """
+    Evaluate a SPARQL expression against a solution binding.
+
+    Args:
+        expr: rdflib algebra expression node
+        solution: dict mapping variable names to Term values
+        exists_cb: optional callback(graph_node, solution) -> bool for
+            EXISTS/NOT EXISTS evaluation; provided by algebra.py
+
+    Returns:
+        The result value (Term, bool, number, string, or None)
+    """
+    global _exists_callback
+    if exists_cb is not None:
+        _exists_callback = exists_cb
+
+    if expr is None:
+        return True
+
+    # rdflib Variable
+    if isinstance(expr, Variable):
+        name = str(expr)
+        return solution.get(name)
+
+    # rdflib concrete terms
+    if isinstance(expr, URIRef):
+        return Term(type=IRI, iri=str(expr))
+
+    if isinstance(expr, Literal):
+        return rdflib_term_to_term(expr)
+
+    if isinstance(expr, BNode):
+        return Term(type=BLANK, id=str(expr))
+
+    # Boolean constants
+    if isinstance(expr, bool):
+        return expr
+
+    # Numeric constants
+    if isinstance(expr, (int, float)):
+        return expr
+
+    # String constants
+    if isinstance(expr, str):
+        return expr
+
+    # CompValue nodes from rdflib algebra
+    if isinstance(expr, CompValue):
+        return _evaluate_comp_value(expr, solution)
+
+    # List/tuple (e.g. function arguments)
+    if isinstance(expr, (list, tuple)):
+        return [evaluate_expression(e, solution) for e in expr]
+
+    logger.warning(f"Unknown expression type: {type(expr)}: {expr}")
+    return None
+
+
+def _evaluate_comp_value(node, solution):
+    """Evaluate a CompValue expression node."""
+    name = node.name
+
+    # Relational expressions: =, !=, <, >, <=, >=
+    if name == "RelationalExpression":
+        return _eval_relational(node, solution)
+
+    # Conditional AND / OR
+    if name == "ConditionalAndExpression":
+        return _eval_conditional_and(node, solution)
+
+    if name == "ConditionalOrExpression":
+        return _eval_conditional_or(node, solution)
+
+    # Unary NOT
+    if name == "UnaryNot":
+        val = evaluate_expression(node.expr, solution)
+        return not _effective_boolean(val)
+
+    # Unary plus/minus
+    if name == "UnaryPlus":
+        return _to_numeric(evaluate_expression(node.expr, solution))
+
+    if name == "UnaryMinus":
+        val = _to_numeric(evaluate_expression(node.expr, solution))
+        return -val if val is not None else None
+
+    # Arithmetic
+    if name == "AdditiveExpression":
+        return _eval_additive(node, solution)
+
+    if name == "MultiplicativeExpression":
+        return _eval_multiplicative(node, solution)
+
+    # IN / NOT IN — must be checked before the generic Builtin_ dispatch
+    if name == "Builtin_IN":
+        return _eval_in(node, solution)
+
+    if name == "Builtin_NOTIN":
+        return not _eval_in(node, solution)
+
+    # SPARQL built-in functions
+    if name.startswith("Builtin_"):
+        return _eval_builtin(name, node, solution)
+
+    # Function call
+    if name == "Function":
+        return _eval_function(node, solution)
+
+    # TrueFilter (used with OPTIONAL)
+    if name == "TrueFilter":
+        return True
+
+    logger.warning(f"Unknown CompValue expression: {name}")
+    return None
+
+
+def _eval_relational(node, solution):
+    """Evaluate a relational expression (=, !=, <, >, <=, >=)."""
+    left = evaluate_expression(node.expr, solution)
+    right = evaluate_expression(node.other, solution)
+    op = node.op
+
+    if left is None or right is None:
+        return False
+
+    left_cmp = _comparable_value(left)
+    right_cmp = _comparable_value(right)
+
+    ops = {
+        "=": operator.eq, "==": operator.eq,
+        "!=": operator.ne,
+        "<": operator.lt,
+        ">": operator.gt,
+        "<=": operator.le,
+        ">=": operator.ge,
+    }
+
+    if str(op) == "IN":
+        items = node.other if isinstance(node.other, list) else [node.other]
+        for item in items:
+            other_val = evaluate_expression(item, solution)
+            if _comparable_value(left) == _comparable_value(other_val):
+                return True
+        return False
+
+    if str(op) == "NOT IN":
+        items = node.other if isinstance(node.other, list) else [node.other]
+        for item in items:
+            other_val = evaluate_expression(item, solution)
+            if _comparable_value(left) == _comparable_value(other_val):
+                return False
+        return True
+
+    op_fn = ops.get(str(op))
+    if op_fn is None:
+        logger.warning(f"Unknown relational operator: {op}")
+        return False
+
+    try:
+        return op_fn(left_cmp, right_cmp)
+    except TypeError:
+        return False
+
+
+def _eval_conditional_and(node, solution):
+    """Evaluate AND expression."""
+    result = _effective_boolean(evaluate_expression(node.expr, solution))
+    if not result:
+        return False
+    for other in node.other:
+        result = _effective_boolean(evaluate_expression(other, solution))
+        if not result:
+            return False
+    return True
+
+
+def _eval_conditional_or(node, solution):
+    """Evaluate OR expression."""
+    result = _effective_boolean(evaluate_expression(node.expr, solution))
+    if result:
+        return True
+    for other in node.other:
+        result = _effective_boolean(evaluate_expression(other, solution))
+        if result:
+            return True
+    return False
+
+
+def _eval_additive(node, solution):
+    """Evaluate additive expression (a + b - c ...)."""
+    result = _to_numeric(evaluate_expression(node.expr, solution))
+    if result is None:
+        return None
+    for op, operand in zip(node.op, node.other):
+        val = _to_numeric(evaluate_expression(operand, solution))
+        if val is None:
+            return None
+        if str(op) == "+":
+            result = result + val
+        elif str(op) == "-":
+            result = result - val
+    return result
+
+
+def _eval_multiplicative(node, solution):
+    """Evaluate multiplicative expression (a * b / c ...)."""
+    result = _to_numeric(evaluate_expression(node.expr, solution))
+    if result is None:
+        return None
+    for op, operand in zip(node.op, node.other):
+        val = _to_numeric(evaluate_expression(operand, solution))
+        if val is None:
+            return None
+        if str(op) == "*":
+            result = result * val
+        elif str(op) == "/":
+            if val == 0:
+                return None
+            result = result / val
+    return result
+
+
+def _eval_builtin(name, node, solution):
+    """Evaluate SPARQL built-in functions."""
+    builtin = name[len("Builtin_"):]
+
+    if builtin == "BOUND":
+        var_name = str(node.arg)
+        return var_name in solution and solution[var_name] is not None
+
+    if builtin == "isIRI" or builtin == "isURI":
+        val = evaluate_expression(node.arg, solution)
+        return isinstance(val, Term) and val.type == IRI
+
+    if builtin == "isLITERAL":
+        val = evaluate_expression(node.arg, solution)
+        return isinstance(val, Term) and val.type == LITERAL
+
+    if builtin == "isBLANK":
+        val = evaluate_expression(node.arg, solution)
+        return isinstance(val, Term) and val.type == BLANK
+
+    if builtin == "STR":
+        val = evaluate_expression(node.arg, solution)
+        return Term(type=LITERAL, value=_to_string(val))
+
+    if builtin == "LANG":
+        val = evaluate_expression(node.arg, solution)
+        if isinstance(val, Term) and val.type == LITERAL:
+            return Term(type=LITERAL, value=val.language or "")
+        return Term(type=LITERAL, value="")
+
+    if builtin == "DATATYPE":
+        val = evaluate_expression(node.arg, solution)
+        if isinstance(val, Term) and val.type == LITERAL and val.datatype:
+            return Term(type=IRI, iri=val.datatype)
+        return Term(type=IRI, iri="http://www.w3.org/2001/XMLSchema#string")
+
+    if builtin == "REGEX":
+        text = _to_string(evaluate_expression(node.text, solution))
+        pattern = _to_string(evaluate_expression(node.pattern, solution))
+        flags_str = ""
+        if hasattr(node, "flags") and node.flags is not None:
+            flags_str = _to_string(evaluate_expression(node.flags, solution))
+
+        re_flags = 0
+        if "i" in flags_str:
+            re_flags |= re.IGNORECASE
+        if "m" in flags_str:
+            re_flags |= re.MULTILINE
+        if "s" in flags_str:
+            re_flags |= re.DOTALL
+
+        try:
+            return bool(re.search(pattern, text, re_flags))
+        except re.error:
+            return False
+
+    if builtin == "STRLEN":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return len(val)
+
+    if builtin == "UCASE":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return Term(type=LITERAL, value=val.upper())
+
+    if builtin == "LCASE":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return Term(type=LITERAL, value=val.lower())
+
+    if builtin == "CONTAINS":
+        string = _to_string(evaluate_expression(node.arg1, solution))
+        pattern = _to_string(evaluate_expression(node.arg2, solution))
+        return pattern in string
+
+    if builtin == "STRSTARTS":
+        string = _to_string(evaluate_expression(node.arg1, solution))
+        prefix = _to_string(evaluate_expression(node.arg2, solution))
+        return string.startswith(prefix)
+
+    if builtin == "STRENDS":
+        string = _to_string(evaluate_expression(node.arg1, solution))
+        suffix = _to_string(evaluate_expression(node.arg2, solution))
+        return string.endswith(suffix)
+
+    if builtin == "CONCAT":
+        args = [_to_string(evaluate_expression(a, solution)) for a in node.arg]
+        return Term(type=LITERAL, value="".join(args))
+
+    if builtin == "IF":
+        cond = _effective_boolean(evaluate_expression(node.arg1, solution))
+        if cond:
+            return evaluate_expression(node.arg2, solution)
+        else:
+            return evaluate_expression(node.arg3, solution)
+
+    if builtin == "COALESCE":
+        for arg in node.arg:
+            val = evaluate_expression(arg, solution)
+            if val is not None:
+                return val
+        return None
+
+    if builtin == "YEAR":
+        dt = _to_datetime(evaluate_expression(node.arg, solution))
+        return dt.year if dt is not None else None
+
+    if builtin == "MONTH":
+        dt = _to_datetime(evaluate_expression(node.arg, solution))
+        return dt.month if dt is not None else None
+
+    if builtin == "DAY":
+        dt = _to_datetime(evaluate_expression(node.arg, solution))
+        return dt.day if dt is not None else None
+
+    if builtin == "HOURS":
+        dt = _to_datetime(evaluate_expression(node.arg, solution))
+        if dt is None:
+            return None
+        return dt.hour if isinstance(dt, datetime) else 0
+
+    if builtin == "MINUTES":
+        dt = _to_datetime(evaluate_expression(node.arg, solution))
+        if dt is None:
+            return None
+        return dt.minute if isinstance(dt, datetime) else 0
+
+    if builtin == "SECONDS":
+        dt = _to_datetime(evaluate_expression(node.arg, solution))
+        if dt is None:
+            return None
+        return dt.second if isinstance(dt, datetime) else 0
+
+    if builtin == "FLOOR":
+        val = _to_numeric(evaluate_expression(node.arg, solution))
+        if val is None:
+            return None
+        return int(math.floor(val))
+
+    if builtin == "CEIL":
+        val = _to_numeric(evaluate_expression(node.arg, solution))
+        if val is None:
+            return None
+        return int(math.ceil(val))
+
+    if builtin == "ABS":
+        val = _to_numeric(evaluate_expression(node.arg, solution))
+        if val is None:
+            return None
+        return abs(val)
+
+    if builtin == "ROUND":
+        val = _to_numeric(evaluate_expression(node.arg, solution))
+        if val is None:
+            return None
+        return round(val)
+
+    if builtin == "STRBEFORE":
+        string = _to_string(evaluate_expression(node.arg1, solution))
+        sep = _to_string(evaluate_expression(node.arg2, solution))
+        idx = string.find(sep)
+        if idx < 0:
+            return Term(type=LITERAL, value="")
+        return Term(type=LITERAL, value=string[:idx])
+
+    if builtin == "STRAFTER":
+        string = _to_string(evaluate_expression(node.arg1, solution))
+        sep = _to_string(evaluate_expression(node.arg2, solution))
+        idx = string.find(sep)
+        if idx < 0:
+            return Term(type=LITERAL, value="")
+        return Term(type=LITERAL, value=string[idx + len(sep):])
+
+    if builtin == "ENCODE_FOR_URI":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return Term(type=LITERAL, value=quote(val, safe=""))
+
+    if builtin == "REPLACE":
+        string = _to_string(evaluate_expression(node.arg, solution))
+        pattern = _to_string(evaluate_expression(node.pattern, solution))
+        replacement = _to_string(
+            evaluate_expression(node.replacement, solution)
+        )
+        flags_str = ""
+        if hasattr(node, "flags") and node.flags is not None:
+            flags_str = _to_string(evaluate_expression(node.flags, solution))
+        re_flags = 0
+        if "i" in flags_str:
+            re_flags |= re.IGNORECASE
+        if "m" in flags_str:
+            re_flags |= re.MULTILINE
+        if "s" in flags_str:
+            re_flags |= re.DOTALL
+        try:
+            result = re.sub(pattern, replacement, string, flags=re_flags)
+            return Term(type=LITERAL, value=result)
+        except re.error:
+            return None
+
+    if builtin == "SUBSTR":
+        string = _to_string(evaluate_expression(node.arg, solution))
+        start = _to_numeric(evaluate_expression(node.start, solution))
+        if start is None:
+            return None
+        start_idx = max(int(start) - 1, 0)
+        if hasattr(node, "length") and node.length is not None:
+            length = _to_numeric(evaluate_expression(node.length, solution))
+            if length is None:
+                return None
+            return Term(
+                type=LITERAL, value=string[start_idx:start_idx + int(length)]
+            )
+        return Term(type=LITERAL, value=string[start_idx:])
+
+    if builtin == "EXISTS":
+        if _exists_callback is not None:
+            return _exists_callback(node.graph, solution)
+        logger.warning("EXISTS requires an exists_cb; not available")
+        return True
+
+    if builtin == "NOTEXISTS":
+        if _exists_callback is not None:
+            return not _exists_callback(node.graph, solution)
+        logger.warning("NOT EXISTS requires an exists_cb; not available")
+        return True
+
+    if builtin == "LANGMATCHES":
+        tag = _to_string(evaluate_expression(node.arg1, solution))
+        rng = _to_string(evaluate_expression(node.arg2, solution))
+        if rng == "*":
+            return len(tag) > 0
+        return tag.lower().startswith(rng.lower())
+
+    if builtin == "IRI" or builtin == "URI":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return Term(type=IRI, iri=val)
+
+    if builtin == "BNODE":
+        if hasattr(node, "arg") and node.arg is not None:
+            label = _to_string(evaluate_expression(node.arg, solution))
+            return Term(type=BLANK, id=label)
+        return Term(type=BLANK, id=str(uuid.uuid4()))
+
+    if builtin == "NOW":
+        now = datetime.now(timezone.utc)
+        return Term(
+            type=LITERAL,
+            value=now.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            datatype="http://www.w3.org/2001/XMLSchema#dateTime",
+        )
+
+    if builtin == "TZ":
+        dt = _to_datetime(evaluate_expression(node.arg, solution))
+        if dt is None:
+            return Term(type=LITERAL, value="")
+        if dt.tzinfo is not None:
+            offset = dt.strftime("%z")
+            if offset:
+                return Term(type=LITERAL, value=offset[:3] + ":" + offset[3:])
+        return Term(type=LITERAL, value="")
+
+    if builtin == "RAND":
+        return random.random()
+
+    if builtin == "UUID":
+        return Term(type=IRI, iri="urn:uuid:" + str(uuid.uuid4()))
+
+    if builtin == "STRUUID":
+        return Term(type=LITERAL, value=str(uuid.uuid4()))
+
+    if builtin == "MD5":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return Term(
+            type=LITERAL, value=hashlib.md5(val.encode()).hexdigest()
+        )
+
+    if builtin == "SHA1":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return Term(
+            type=LITERAL, value=hashlib.sha1(val.encode()).hexdigest()
+        )
+
+    if builtin == "SHA256":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return Term(
+            type=LITERAL, value=hashlib.sha256(val.encode()).hexdigest()
+        )
+
+    if builtin == "SHA512":
+        val = _to_string(evaluate_expression(node.arg, solution))
+        return Term(
+            type=LITERAL, value=hashlib.sha512(val.encode()).hexdigest()
+        )
+
+    if builtin == "sameTerm":
+        left = evaluate_expression(node.arg1, solution)
+        right = evaluate_expression(node.arg2, solution)
+        if not isinstance(left, Term) or not isinstance(right, Term):
+            return False
+        from . solutions import _term_key
+        return _term_key(left) == _term_key(right)
+
+    logger.warning(f"Unsupported built-in function: {builtin}")
+    return None
+
+
+def _eval_function(node, solution):
+    """Evaluate a SPARQL function call."""
+    # Cast functions (xsd:integer, xsd:string, etc.)
+    iri = str(node.iri) if hasattr(node, "iri") else ""
+    args = [evaluate_expression(a, solution) for a in node.expr]
+
+    xsd = "http://www.w3.org/2001/XMLSchema#"
+    if iri == xsd + "integer":
+        try:
+            return int(_to_numeric(args[0]))
+        except (TypeError, ValueError):
+            return None
+    elif iri == xsd + "decimal" or iri == xsd + "double" or iri == xsd + "float":
+        try:
+            return float(_to_numeric(args[0]))
+        except (TypeError, ValueError):
+            return None
+    elif iri == xsd + "string":
+        return Term(type=LITERAL, value=_to_string(args[0]))
+    elif iri == xsd + "boolean":
+        return _effective_boolean(args[0])
+
+    logger.warning(f"Unsupported function: {iri}")
+    return None
+
+
+def _eval_in(node, solution):
+    """Evaluate IN expression."""
+    val = evaluate_expression(node.expr, solution)
+    for item in node.other:
+        other = evaluate_expression(item, solution)
+        if _comparable_value(val) == _comparable_value(other):
+            return True
+    return False
+
+
+# --- Value conversion helpers ---
+
+def _effective_boolean(val):
+    """Convert a value to its effective boolean value (EBV)."""
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        return len(val) > 0
+    if isinstance(val, Term):
+        if val.type == LITERAL:
+            v = val.value
+            if val.datatype == "http://www.w3.org/2001/XMLSchema#boolean":
+                return v.lower() in ("true", "1")
+            if val.datatype in (
+                "http://www.w3.org/2001/XMLSchema#integer",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+                "http://www.w3.org/2001/XMLSchema#double",
+                "http://www.w3.org/2001/XMLSchema#float",
+            ):
+                try:
+                    return float(v) != 0
+                except ValueError:
+                    return False
+            return len(v) > 0
+        return True
+    return bool(val)
+
+
+def _to_string(val):
+    """Convert a value to a string."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, Term):
+        if val.type == IRI:
+            return val.iri
+        elif val.type == LITERAL:
+            return val.value
+        elif val.type == BLANK:
+            return val.id
+    return str(val)
+
+
+def _to_numeric(val):
+    """Convert a value to a number."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return val
+    if isinstance(val, Term) and val.type == LITERAL:
+        try:
+            if "." in val.value:
+                return float(val.value)
+            return int(val.value)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(val, str):
+        try:
+            if "." in val:
+                return float(val)
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _to_datetime(val):
+    """Convert a value to a date or datetime object."""
+    if val is None:
+        return None
+    s = _to_string(val)
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        pass
+    return None
+
+
+def _comparable_value(val):
+    """
+    Convert a value to a form suitable for comparison.
+    Returns a tuple (type, value) for consistent ordering.
+    """
+    if val is None:
+        return (0, "")
+    if isinstance(val, bool):
+        return (1, val)
+    if isinstance(val, (int, float)):
+        return (2, val)
+    if isinstance(val, str):
+        return (3, val)
+    if isinstance(val, Term):
+        if val.type == IRI:
+            return (4, val.iri)
+        elif val.type == LITERAL:
+            # Try numeric comparison for numeric types
+            num = _to_numeric(val)
+            if num is not None:
+                return (2, num)
+            return (3, val.value)
+        elif val.type == BLANK:
+            return (5, val.id)
+    return (6, str(val))

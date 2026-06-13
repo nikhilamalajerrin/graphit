@@ -1,0 +1,213 @@
+"""
+Row embeddings query service for Qdrant.
+
+Input is query vectors plus workspace/collection/schema context.
+Output is matching row index information (index_name, index_value) for
+use in subsequent Cassandra lookups.
+"""
+
+import asyncio
+import logging
+import re
+from typing import Optional
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+from .... schema import (
+    RowEmbeddingsRequest, RowEmbeddingsResponse,
+    RowIndexMatch, Error
+)
+from .... base import FlowProcessor, ConsumerSpec, ProducerSpec
+from .... base.qdrant_config import add_qdrant_args, resolve_qdrant_config
+
+# Module logger
+logger = logging.getLogger(__name__)
+
+default_ident = "row-embeddings-query"
+default_concurrency = 10
+
+
+class Processor(FlowProcessor):
+
+    def __init__(self, **params):
+
+        id = params.get("id", default_ident)
+        concurrency = params.get("concurrency", default_concurrency)
+
+        store_uri = params.get("store_uri")
+        api_key = params.get("api_key")
+
+        url, api_key, _, _ = resolve_qdrant_config(
+            url=store_uri, api_key=api_key,
+        )
+
+        super(Processor, self).__init__(
+            **params | {
+                "id": id,
+                "store_uri": url,
+                "api_key": api_key,
+            }
+        )
+
+        self.register_specification(
+            ConsumerSpec(
+                name="request",
+                schema=RowEmbeddingsRequest,
+                handler=self.on_message,
+                concurrency=concurrency,
+            )
+        )
+
+        self.register_specification(
+            ProducerSpec(
+                name="response",
+                schema=RowEmbeddingsResponse
+            )
+        )
+
+        self.qdrant = QdrantClient(url=url, api_key=api_key)
+
+    def sanitize_name(self, name: str) -> str:
+        """Sanitize names for Qdrant collection naming"""
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+        if safe_name and not safe_name[0].isalpha():
+            safe_name = 'r_' + safe_name
+        return safe_name.lower()
+
+    async def find_collection(self, workspace: str, collection: str, schema_name: str) -> Optional[str]:
+        """Find the Qdrant collection for a given workspace/collection/schema"""
+        prefix = (
+            f"rows_{self.sanitize_name(workspace)}_"
+            f"{self.sanitize_name(collection)}_{self.sanitize_name(schema_name)}_"
+        )
+
+        try:
+            all_collections = await asyncio.to_thread(
+                lambda: self.qdrant.get_collections().collections
+            )
+            matching = [
+                coll.name for coll in all_collections
+                if coll.name.startswith(prefix)
+            ]
+
+            if matching:
+                return matching[0]
+
+        except Exception as e:
+            logger.error(f"Failed to list Qdrant collections: {e}", exc_info=True)
+
+        return None
+
+    async def query_row_embeddings(self, workspace, request: RowEmbeddingsRequest):
+        """Execute row embeddings query"""
+
+        vec = request.vector
+        if not vec:
+            return []
+
+        qdrant_collection = await self.find_collection(
+            workspace, request.collection, request.schema_name
+        )
+
+        if not qdrant_collection:
+            logger.info(
+                f"No Qdrant collection found for "
+                f"{workspace}/{request.collection}/{request.schema_name}"
+            )
+            return []
+
+        try:
+            query_filter = None
+            if request.index_name:
+                query_filter = Filter(
+                    must=[
+                        FieldCondition(
+                            key="index_name",
+                            match=MatchValue(value=request.index_name)
+                        )
+                    ]
+                )
+
+            result = await asyncio.to_thread(
+                self.qdrant.query_points,
+                collection_name=qdrant_collection,
+                query=vec,
+                limit=request.limit,
+                with_payload=True,
+                query_filter=query_filter,
+            )
+            search_result = result.points
+
+            matches = []
+            for point in search_result:
+                payload = point.payload or {}
+                match = RowIndexMatch(
+                    index_name=payload.get("index_name", ""),
+                    index_value=payload.get("index_value", []),
+                    text=payload.get("text", ""),
+                    score=point.score if hasattr(point, 'score') else 0.0
+                )
+                matches.append(match)
+
+            return matches
+
+        except Exception as e:
+            logger.error(f"Failed to query Qdrant: {e}", exc_info=True)
+            raise
+
+    async def on_message(self, msg, consumer, flow):
+        """Handle incoming query request"""
+
+        try:
+            request = msg.value()
+
+            # Sender-produced ID
+            id = msg.properties()["id"]
+
+            logger.debug(
+                f"Handling row embeddings query for "
+                f"{flow.workspace}/{request.collection}/{request.schema_name}..."
+            )
+
+            # Execute query
+            matches = await self.query_row_embeddings(flow.workspace, request)
+
+            response = RowEmbeddingsResponse(
+                error=None,
+                matches=matches
+            )
+
+            logger.debug(f"Returning {len(matches)} matches")
+            await flow("response").send(response, properties={"id": id})
+
+        except Exception as e:
+            logger.error(f"Exception in row embeddings query: {e}", exc_info=True)
+
+            response = RowEmbeddingsResponse(
+                error=Error(
+                    type="row-embeddings-query-error",
+                    message=str(e)
+                ),
+                matches=[]
+            )
+
+            await flow("response").send(response, properties={"id": id})
+
+    @staticmethod
+    def add_args(parser):
+
+        FlowProcessor.add_args(parser)
+        add_qdrant_args(parser)
+
+        parser.add_argument(
+            '-c', '--concurrency',
+            type=int,
+            default=default_concurrency,
+            help=f'Number of concurrent requests (default: {default_concurrency})'
+        )
+
+
+def run():
+    """Entry point for row-embeddings-query-qdrant command"""
+    Processor.launch(default_ident, __doc__)

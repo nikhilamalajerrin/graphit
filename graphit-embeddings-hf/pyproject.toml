@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphit-embeddings-hf"
+dynamic = ["version"]
+authors = [{name = "graphit.ai", email = "security@graphit.ai"}]
+description = "HuggingFace embeddings support for GraphIt."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "graphit-base>=2.5,<2.6",
+    "graphit-flow>=2.5,<2.6",
+    "torch",
+    "urllib3",
+    "transformers",
+    "sentence-transformers",
+    "langchain",
+    "langchain-core",
+    "langchain-huggingface",
+    "langchain-community",
+    "huggingface-hub",
+    "pulsar-client",
+    "pyyaml",
+    "prometheus-client",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/graphit-ai/graphit"
+
+[project.scripts]
+embeddings-hf = "graphit.embeddings.hf:run"
+
+[tool.setuptools.packages.find]
+include = ["graphit*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "graphit.embeddings_hf_version.__version__"}

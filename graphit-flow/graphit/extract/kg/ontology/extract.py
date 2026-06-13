@@ -1,0 +1,1010 @@
+"""
+OntoRAG: Ontology-based knowledge extraction service.
+Extracts ontology-conformant triples from text chunks.
+"""
+
+import json
+import logging
+import asyncio
+from typing import List, Dict, Any, Optional
+
+from .... schema import Chunk, Triple, Triples, Metadata, Term, IRI, LITERAL
+from .... schema import EntityContext, EntityContexts
+from .... schema import PromptRequest, PromptResponse
+from .... rdf import GRAPHIT_ENTITIES, RDF_TYPE, RDF_LABEL, DEFINITION
+from .... base import FlowProcessor, ConsumerSpec, ProducerSpec
+from .... base import PromptClientSpec, EmbeddingsClientSpec
+
+from .ontology_loader import OntologyLoader
+from .ontology_embedder import OntologyEmbedder
+from .vector_store import InMemoryVectorStore
+from .text_processor import TextProcessor
+from .ontology_selector import OntologySelector, OntologySubset
+from .simplified_parser import parse_extraction_response
+from .triple_converter import TripleConverter
+
+from .... provenance import subgraph_uri, subgraph_provenance_triples, set_graph, GRAPH_SOURCE
+from .... flow_version import __version__ as COMPONENT_VERSION
+
+logger = logging.getLogger(__name__)
+
+default_ident = "kg-extract-ontology"
+default_concurrency = 1
+default_triples_batch_size = 50
+default_entity_batch_size = 5
+
+# URI prefix mappings for common namespaces
+URI_PREFIXES = {
+    "rdf:": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs:": "http://www.w3.org/2000/01/rdf-schema#",
+    "owl:": "http://www.w3.org/2002/07/owl#",
+    "skos:": "http://www.w3.org/2004/02/skos/core#",
+    "schema:": "https://schema.org/",
+    "xsd:": "http://www.w3.org/2001/XMLSchema#",
+}
+
+
+def make_term(v, is_uri):
+    """Helper to create Term from value and is_uri flag."""
+    if is_uri:
+        return Term(type=IRI, iri=v)
+    else:
+        return Term(type=LITERAL, value=v)
+
+
+class Processor(FlowProcessor):
+    """Main OntoRAG extraction processor."""
+
+    def __init__(self, **params):
+        id = params.get("id", default_ident)
+        concurrency = params.get("concurrency", default_concurrency)
+        self.triples_batch_size = params.get("triples_batch_size", default_triples_batch_size)
+        self.entity_batch_size = params.get("entity_batch_size", default_entity_batch_size)
+
+        super(Processor, self).__init__(
+            **params | {
+                "id": id,
+                "concurrency": concurrency,
+            }
+        )
+
+        # Register specifications
+        self.register_specification(
+            ConsumerSpec(
+                name="input",
+                schema=Chunk,
+                handler=self.on_message,
+                concurrency=concurrency,
+            )
+        )
+
+        self.register_specification(
+            PromptClientSpec(
+                request_name="prompt-request",
+                response_name="prompt-response",
+            )
+        )
+
+        self.register_specification(
+            EmbeddingsClientSpec(
+                request_name="embeddings-request",
+                response_name="embeddings-response"
+            )
+        )
+
+        self.register_specification(
+            ProducerSpec(
+                name="triples",
+                schema=Triples
+            )
+        )
+
+        self.register_specification(
+            ProducerSpec(
+                name="entity-contexts",
+                schema=EntityContexts
+            )
+        )
+
+        # Register config handler for ontology updates
+        self.register_config_handler(self.on_ontology_config, types=["ontology"])
+
+        # Per-workspace ontology loaders
+        self.ontology_loaders = {}  # workspace -> OntologyLoader
+        self.text_processor = TextProcessor()
+
+        # Per-flow components (each flow gets its own embedder/vector
+        # store/selector). Keyed by id(flow) — Flow objects are unique
+        # per (workspace, flow), so this is implicitly workspace-scoped.
+        self.flow_components = {}
+
+        # Configuration
+        self.top_k = params.get("top_k", 10)
+        self.similarity_threshold = params.get("similarity_threshold", 0.3)
+        self.bypass_selector_below = params.get("bypass_selector_below", 5)
+
+        # Per-workspace ontology version tracking
+        self.current_ontology_versions = {}  # workspace -> version
+        self.loaded_ontology_ids = {}  # workspace -> set of ids
+
+    async def initialize_flow_components(self, flow):
+        """Initialize per-flow OntoRAG components.
+
+        Each flow gets its own vector store and embedder to support
+        different embedding models across flows. The vector store dimension
+        is auto-detected from the embeddings service.
+
+        Args:
+            flow: Flow object for this processing context
+
+        Returns:
+            flow_id: Identifier for this flow's components
+        """
+        # Use flow object as identifier
+        flow_id = id(flow)
+
+        if flow_id in self.flow_components:
+            return flow_id  # Already initialized for this flow
+
+        try:
+            logger.info(f"Initializing components for flow {flow_id}")
+
+            # Use embeddings client directly (no wrapper needed)
+            embeddings_client = flow("embeddings-request")
+
+            # Detect embedding dimension by embedding a test string
+            logger.info("Detecting embedding dimension from embeddings service...")
+            test_embedding_response = await embeddings_client.embed(["test"])
+            test_embedding = test_embedding_response[0]  # Extract first vector
+            dimension = len(test_embedding)
+            logger.info(f"Detected embedding dimension: {dimension}")
+
+            # Initialize vector store with detected dimension
+            vector_store = InMemoryVectorStore(
+                dimension=dimension,
+                index_type='flat'
+            )
+
+            ontology_embedder = OntologyEmbedder(
+                embedding_service=embeddings_client,
+                vector_store=vector_store
+            )
+
+            workspace = flow.workspace
+
+            # Embed all loaded ontologies for this workspace
+            loader = self.ontology_loaders.get(workspace)
+            if loader is not None and loader.get_all_ontologies():
+                logger.info(
+                    f"Embedding ontologies for flow {flow_id} "
+                    f"(workspace {workspace})"
+                )
+                for ont_id, ontology in loader.get_all_ontologies().items():
+                    await ontology_embedder.embed_ontology(ontology)
+                logger.info(f"Embedded {ontology_embedder.get_embedded_count()} ontology elements for flow {flow_id}")
+
+            # Initialize ontology selector
+            ontology_selector = OntologySelector(
+                ontology_embedder=ontology_embedder,
+                ontology_loader=loader,
+                top_k=self.top_k,
+                similarity_threshold=self.similarity_threshold,
+                bypass_selector_below=self.bypass_selector_below,
+            )
+
+            # Store flow-specific components
+            self.flow_components[flow_id] = {
+                'embedder': ontology_embedder,
+                'vector_store': vector_store,
+                'selector': ontology_selector,
+                'dimension': dimension,
+                'workspace': workspace,
+            }
+
+            logger.info(f"Flow {flow_id} components initialized successfully (dimension={dimension})")
+            return flow_id
+
+        except Exception as e:
+            logger.error(f"Failed to initialize flow {flow_id} components: {e}", exc_info=True)
+            raise
+
+    async def on_ontology_config(self, workspace, config, version):
+        """Handle ontology configuration updates for a workspace."""
+        try:
+            logger.info(
+                f"Received ontology config update, "
+                f"version={version} workspace={workspace}"
+            )
+
+            # Skip if we've already processed this version for this workspace
+            if version == self.current_ontology_versions.get(workspace):
+                logger.debug(
+                    f"Already at version {version} for {workspace}, "
+                    f"skipping"
+                )
+                return
+
+            # Extract ontology configurations
+            if "ontology" not in config:
+                logger.warning(
+                    f"No 'ontology' section in config for {workspace}"
+                )
+                return
+
+            ontology_configs = config["ontology"]
+
+            # Parse ontology definitions
+            ontologies = {}
+            for ont_id, ont_json in ontology_configs.items():
+                try:
+                    ontologies[ont_id] = json.loads(ont_json)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse ontology '{ont_id}': {e}")
+                    continue
+
+            logger.info(
+                f"Loaded {len(ontologies)} ontology definitions "
+                f"for {workspace}"
+            )
+
+            # Determine what changed for this workspace
+            ws_loaded_ids = self.loaded_ontology_ids.get(workspace, set())
+            new_ids = set(ontologies.keys())
+            added_ids = new_ids - ws_loaded_ids
+            removed_ids = ws_loaded_ids - new_ids
+            updated_ids = new_ids & ws_loaded_ids  # May have changed content
+
+            if added_ids:
+                logger.info(f"New ontologies in {workspace}: {added_ids}")
+            if removed_ids:
+                logger.info(f"Removed ontologies in {workspace}: {removed_ids}")
+            if updated_ids:
+                logger.info(f"Updated ontologies in {workspace}: {updated_ids}")
+
+            # Get or create per-workspace loader
+            loader = self.ontology_loaders.get(workspace)
+            if loader is None:
+                loader = OntologyLoader()
+                self.ontology_loaders[workspace] = loader
+            loader.update_ontologies(ontologies)
+
+            # Clear flow components for this workspace to force
+            # re-embedding with new ontologies.
+            if added_ids or removed_ids or updated_ids:
+                self._clear_workspace_flow_components(workspace)
+
+            # Update tracking
+            self.current_ontology_versions[workspace] = version
+            self.loaded_ontology_ids[workspace] = new_ids
+
+            logger.info(
+                f"Ontology config update complete for {workspace}, "
+                f"version={version}"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to process ontology config: {e}", exc_info=True)
+
+    def _clear_workspace_flow_components(self, workspace):
+        """Drop cached flow components belonging to the given workspace
+        so they're re-initialised on next message with fresh ontology
+        embeddings."""
+        to_remove = [
+            fid for fid, comp in self.flow_components.items()
+            if comp.get("workspace") == workspace
+        ]
+        if to_remove:
+            logger.info(
+                f"Clearing {len(to_remove)} flow components for "
+                f"workspace {workspace}"
+            )
+        for fid in to_remove:
+            del self.flow_components[fid]
+
+    async def on_message(self, msg, consumer, flow):
+        """Process incoming chunk message."""
+        v = msg.value()
+        logger.info(f"Extracting ontology-based triples from {v.metadata.id}...")
+
+        # Initialize flow-specific components if needed
+        flow_id = await self.initialize_flow_components(flow)
+        components = self.flow_components[flow_id]
+
+        chunk = v.chunk.decode("utf-8")
+        logger.debug(f"Processing chunk: {chunk[:200]}...")
+
+        try:
+            # Process text into segments
+            segments = self.text_processor.process_chunk(chunk, extract_phrases=True)
+            logger.debug(f"Split chunk into {len(segments)} segments")
+
+            # Select relevant ontology subset (using flow-specific selector)
+            ontology_subsets = await components['selector'].select_ontology_subset(segments)
+
+            if not ontology_subsets:
+                logger.warning("No relevant ontology elements found for chunk")
+                return
+
+            # Merge subsets if multiple ontologies matched
+            if len(ontology_subsets) > 1:
+                ontology_subset = components['selector'].merge_subsets(ontology_subsets)
+            else:
+                ontology_subset = ontology_subsets[0]
+
+            logger.debug(f"Selected ontology subset with {len(ontology_subset.classes)} classes, "
+                        f"{len(ontology_subset.object_properties)} object properties, "
+                        f"{len(ontology_subset.datatype_properties)} datatype properties")
+
+            # Build extraction prompt variables
+            prompt_variables = self.build_extraction_variables(chunk, ontology_subset)
+
+            # Extract using simplified entity-relationship-attribute format
+            triples = await self.extract_with_simplified_format(
+                flow, chunk, ontology_subset, prompt_variables
+            )
+
+            # Generate subgraph provenance for extracted triples
+            if triples:
+                chunk_uri = v.metadata.id
+                sg_uri = subgraph_uri()
+                prov_triples = subgraph_provenance_triples(
+                    subgraph_uri=sg_uri,
+                    extracted_triples=triples,
+                    chunk_uri=chunk_uri,
+                    component_name=default_ident,
+                    component_version=COMPONENT_VERSION,
+                )
+
+            # Generate ontology definition triples
+            ontology_triples = self.build_ontology_triples(ontology_subset)
+
+            # Combine extracted triples with ontology triples and provenance
+            all_triples = triples + ontology_triples
+            if triples:
+                all_triples.extend(set_graph(prov_triples, GRAPH_SOURCE))
+
+            # Build entity contexts from all triples (including ontology elements)
+            entity_contexts = self.build_entity_contexts(all_triples)
+
+            # Emit triples in batches
+            for i in range(0, len(all_triples), self.triples_batch_size):
+                batch = all_triples[i:i + self.triples_batch_size]
+                await self.emit_triples(
+                    flow("triples"),
+                    v.metadata,
+                    batch
+                )
+
+            # Emit entity contexts in batches
+            for i in range(0, len(entity_contexts), self.entity_batch_size):
+                batch = entity_contexts[i:i + self.entity_batch_size]
+                await self.emit_entity_contexts(
+                    flow("entity-contexts"),
+                    v.metadata,
+                    batch
+                )
+
+            logger.info(f"Extracted {len(triples)} content triples + {len(ontology_triples)} ontology triples "
+                       f"= {len(all_triples)} total triples and {len(entity_contexts)} entity contexts")
+
+        except Exception as e:
+            logger.error(f"OntoRAG extraction exception: {e}", exc_info=True)
+
+    async def extract_with_simplified_format(
+        self,
+        flow,
+        chunk: str,
+        ontology_subset: OntologySubset,
+        prompt_variables: Dict[str, Any]
+    ) -> List[Triple]:
+        """Extract triples using simplified entity-relationship-attribute format.
+
+        Args:
+            flow: Flow object for accessing services
+            chunk: Text chunk to extract from
+            ontology_subset: Selected ontology subset
+            prompt_variables: Variables for prompt template
+
+        Returns:
+            List of Triple objects
+        """
+        try:
+            # Call prompt service with simplified format prompt
+            result = await flow("prompt-request").prompt(
+                id="extract-with-ontologies",
+                variables=prompt_variables
+            )
+
+            # extract-with-ontologies is a JSONL prompt, so PromptResult
+            # always populates .objects (a list of dicts).  Reading .object
+            # (singular) silently gives None for JSONL responses and drops
+            # every extraction.
+            extraction_response = result.objects
+
+            logger.debug(f"Simplified extraction response: {extraction_response}")
+
+            # Parse response into structured format
+            extraction_result = parse_extraction_response(extraction_response)
+
+            if not extraction_result:
+                logger.warning("Failed to parse extraction response")
+                return []
+
+            logger.info(f"Parsed {len(extraction_result.entities)} entities, "
+                       f"{len(extraction_result.relationships)} relationships, "
+                       f"{len(extraction_result.attributes)} attributes")
+
+            # Convert to RDF triples
+            converter = TripleConverter(ontology_subset, ontology_subset.ontology_id)
+            triples = converter.convert_all(extraction_result)
+
+            logger.info(f"Generated {len(triples)} RDF triples from simplified extraction")
+
+            return triples
+
+        except Exception as e:
+            logger.error(f"Simplified extraction error: {e}", exc_info=True)
+            return []
+
+    def build_extraction_variables(self, chunk: str, ontology_subset: OntologySubset) -> Dict[str, Any]:
+        """Build variables for ontology-based extraction prompt template.
+
+        Args:
+            chunk: Text chunk to extract from
+            ontology_subset: Relevant ontology elements
+
+        Returns:
+            Dict with template variables: text, classes, object_properties, datatype_properties
+        """
+        return {
+            "text": chunk,
+            "classes": ontology_subset.classes,
+            "object_properties": ontology_subset.object_properties,
+            "datatype_properties": ontology_subset.datatype_properties
+        }
+
+    def parse_and_validate_triples(self, triples_response: List[Any],
+                                  ontology_subset: OntologySubset) -> List[Triple]:
+        """Parse and validate extracted triples against ontology."""
+        validated_triples = []
+        ontology_id = ontology_subset.ontology_id
+
+        # Gather entity types for domain/range validation
+        entity_types = {}
+        for triple_data in triples_response:
+            if isinstance(triple_data, dict):
+                s = triple_data.get('subject', '')
+                p = triple_data.get('predicate', '')
+                o = triple_data.get('object', '')
+                if s and p and o and (p == "rdf:type" or p == str(RDF_TYPE)):
+                    entity_types[s] = o
+
+        for triple_data in triples_response:
+            try:
+                if isinstance(triple_data, dict):
+                    subject = triple_data.get('subject', '')
+                    predicate = triple_data.get('predicate', '')
+                    object_val = triple_data.get('object', '')
+
+                    if not subject or not predicate or not object_val:
+                        continue
+
+                    # Validate against ontology
+                    if self.is_valid_triple(subject, predicate, object_val, ontology_subset, entity_types):
+                        # Expand URIs before creating Value objects
+                        subject_uri = self.expand_uri(subject, ontology_subset, ontology_id)
+                        predicate_uri = self.expand_uri(predicate, ontology_subset, ontology_id)
+
+                        # Object might be URI or literal - check before expanding
+                        if self.is_uri(object_val) or self.should_expand_as_uri(object_val, ontology_subset):
+                            object_uri = self.expand_uri(object_val, ontology_subset, ontology_id)
+                            is_object_uri = True
+                        else:
+                            object_uri = object_val
+                            is_object_uri = False
+
+                        # Create Triple object with expanded URIs
+                        s_value = make_term(subject_uri, is_uri=True)
+                        p_value = make_term(predicate_uri, is_uri=True)
+                        o_value = make_term(object_uri, is_uri=is_object_uri)
+
+                        validated_triples.append(Triple(
+                            s=s_value,
+                            p=p_value,
+                            o=o_value
+                        ))
+                    else:
+                        logger.debug(f"Invalid triple: ({subject}, {predicate}, {object_val})")
+
+            except Exception as e:
+                logger.error(f"Error parsing triple: {e}")
+
+        return validated_triples
+
+    def should_expand_as_uri(self, value: str, ontology_subset: OntologySubset) -> bool:
+        """Check if a value should be treated as URI (not literal).
+
+        Returns True if value is a class name, property name, or entity reference.
+        """
+        # Check if it's a class or property from ontology
+        if value in ontology_subset.classes:
+            return True
+        if value in ontology_subset.object_properties:
+            return True
+        if value in ontology_subset.datatype_properties:
+            return True
+        # Check if it starts with a known prefix
+        for prefix in URI_PREFIXES.keys():
+            if value.startswith(prefix):
+                return True
+        # Check if it looks like an entity reference (e.g., "recipe:cornish-pasty")
+        if ":" in value and not value.startswith("http"):
+            return True
+        return False
+
+    def _is_subclass_of(self, cls, target, ontology_subset, max_depth=100):
+        """Return True if cls is a subclass of target via subclass_of chain.
+
+        Defends against cycles in ontology data (LLM-generated ontologies may
+        emit A subclass_of B, B subclass_of A) with a visited set. A depth cap
+        acts as a second line of defense against unbounded chains.
+        """
+        if cls == target:
+            return True
+        visited = set()
+        curr = cls
+        depth = 0
+        while curr in ontology_subset.classes and depth < max_depth:
+            if curr in visited:
+                return False  # cycle detected
+            visited.add(curr)
+            cls_def = ontology_subset.classes[curr]
+            parent = cls_def.get('subclass_of') if isinstance(cls_def, dict) else None
+            if parent is None:
+                return False
+            if parent == target:
+                return True
+            curr = parent
+            depth += 1
+        return False
+
+    def is_valid_triple(self, subject: str, predicate: str, object_val: str,
+                       ontology_subset: OntologySubset, entity_types: dict = None) -> bool:
+        """Validate triple against ontology constraints."""
+        if entity_types is None:
+            entity_types = {}
+
+        # Special case for rdf:type
+        if predicate == "rdf:type" or predicate == str(RDF_TYPE):
+            # Check if object is a valid class
+            return object_val in ontology_subset.classes
+
+        # Special case for rdfs:label
+        if predicate == "rdfs:label" or predicate == str(RDF_LABEL):
+            return True  # Labels are always valid
+
+        # Check if predicate is a valid property
+        is_obj_prop = predicate in ontology_subset.object_properties
+        is_dt_prop = predicate in ontology_subset.datatype_properties
+
+        if not is_obj_prop and not is_dt_prop:
+            return False  # Unknown property
+
+        prop_def = ontology_subset.object_properties[predicate] if is_obj_prop else ontology_subset.datatype_properties[predicate]
+        if not isinstance(prop_def, dict):
+            prop_def = prop_def.__dict__ if hasattr(prop_def, '__dict__') else {}
+
+        # Domain validation
+        expected_domain = prop_def.get('domain')
+        if expected_domain and subject in entity_types:
+            actual_domain = entity_types[subject]
+            if actual_domain != expected_domain and not self._is_subclass_of(
+                actual_domain, expected_domain, ontology_subset
+            ):
+                return False
+
+        # Range validation
+        if is_obj_prop:
+            expected_range = prop_def.get('range')
+            if expected_range and object_val in entity_types:
+                actual_range = entity_types[object_val]
+                if actual_range != expected_range and not self._is_subclass_of(
+                    actual_range, expected_range, ontology_subset
+                ):
+                    return False
+
+        return True
+
+    def expand_uri(self, value: str, ontology_subset: OntologySubset, ontology_id: str = "unknown") -> str:
+        """Expand prefix notation or short names to full URIs.
+
+        Args:
+            value: Value to expand (e.g., "rdf:type", "Recipe", "has_ingredient")
+            ontology_subset: Ontology subset for class/property lookup
+            ontology_id: ID of the ontology for constructing instance URIs
+
+        Returns:
+            Full URI string
+        """
+        # Already a full URI
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+
+        # Check standard prefixes (rdf:, rdfs:, etc.)
+        for prefix, namespace in URI_PREFIXES.items():
+            if value.startswith(prefix):
+                return namespace + value[len(prefix):]
+
+        # Check if it's an ontology class
+        if value in ontology_subset.classes:
+            class_def = ontology_subset.classes[value]
+            # class_def is a dict (from cls.__dict__ in ontology_selector)
+            if isinstance(class_def, dict) and 'uri' in class_def and class_def['uri']:
+                return class_def['uri']
+            # Fallback: construct URI
+            return f"https://graphit.ai/ontology/{ontology_id}#{value}"
+
+        # Check if it's an ontology property
+        if value in ontology_subset.object_properties:
+            prop_def = ontology_subset.object_properties[value]
+            # prop_def is a dict (from prop.__dict__ in ontology_selector)
+            if isinstance(prop_def, dict) and 'uri' in prop_def and prop_def['uri']:
+                return prop_def['uri']
+            return f"https://graphit.ai/ontology/{ontology_id}#{value}"
+
+        if value in ontology_subset.datatype_properties:
+            prop_def = ontology_subset.datatype_properties[value]
+            # prop_def is a dict (from prop.__dict__ in ontology_selector)
+            if isinstance(prop_def, dict) and 'uri' in prop_def and prop_def['uri']:
+                return prop_def['uri']
+            return f"https://graphit.ai/ontology/{ontology_id}#{value}"
+
+        # Otherwise, treat as entity instance - construct unique URI
+        # Normalize the value for URI (lowercase, replace spaces with hyphens)
+        normalized = value.replace(" ", "-").lower()
+        return f"https://graphit.ai/{ontology_id}/{normalized}"
+
+    def is_uri(self, value: str) -> bool:
+        """Check if value is already a full URI."""
+        return value.startswith("http://") or value.startswith("https://")
+
+    async def emit_triples(self, pub, metadata: Metadata, triples: List[Triple]):
+        """Emit triples to output."""
+        t = Triples(
+            metadata=Metadata(
+                id=metadata.id,
+                root=metadata.root,
+                collection=metadata.collection,
+            ),
+            triples=triples,
+        )
+        await pub.send(t)
+
+    async def emit_entity_contexts(self, pub, metadata: Metadata, entities: List[EntityContext]):
+        """Emit entity contexts to output."""
+        ec = EntityContexts(
+            metadata=Metadata(
+                id=metadata.id,
+                root=metadata.root,
+                collection=metadata.collection,
+            ),
+            entities=entities,
+        )
+        await pub.send(ec)
+
+    def build_ontology_triples(self, ontology_subset: OntologySubset) -> List[Triple]:
+        """Build triples describing the ontology elements themselves.
+
+        Generates triples for classes and properties so they exist in the knowledge graph.
+
+        Args:
+            ontology_subset: The ontology subset used for extraction
+
+        Returns:
+            List of Triple objects describing ontology elements
+        """
+        ontology_triples = []
+
+        # Generate triples for classes
+        for class_id, class_def in ontology_subset.classes.items():
+            # Get URI for class
+            if isinstance(class_def, dict) and 'uri' in class_def and class_def['uri']:
+                class_uri = class_def['uri']
+            else:
+                # Fallback to constructed URI
+                class_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{class_id}"
+
+            # rdf:type owl:Class
+            ontology_triples.append(Triple(
+                s=make_term(class_uri, is_uri=True),
+                p=make_term("http://www.w3.org/1999/02/22-rdf-syntax-ns#type", is_uri=True),
+                o=make_term("http://www.w3.org/2002/07/owl#Class", is_uri=True)
+            ))
+
+            # rdfs:label (stored as 'labels' in OntologyClass.__dict__)
+            if isinstance(class_def, dict) and 'labels' in class_def:
+                labels = class_def['labels']
+                if isinstance(labels, list) and labels:
+                    label_val = labels[0].get('value', class_id) if isinstance(labels[0], dict) else str(labels[0])
+                    ontology_triples.append(Triple(
+                        s=make_term(class_uri, is_uri=True),
+                        p=make_term(RDF_LABEL, is_uri=True),
+                        o=make_term(label_val, is_uri=False)
+                    ))
+
+            # rdfs:comment (stored as 'comment' in OntologyClass.__dict__)
+            if isinstance(class_def, dict) and 'comment' in class_def and class_def['comment']:
+                comment = class_def['comment']
+                ontology_triples.append(Triple(
+                    s=make_term(class_uri, is_uri=True),
+                    p=make_term("http://www.w3.org/2000/01/rdf-schema#comment", is_uri=True),
+                    o=make_term(comment, is_uri=False)
+                ))
+
+            # rdfs:subClassOf (stored as 'subclass_of' in OntologyClass.__dict__)
+            if isinstance(class_def, dict) and 'subclass_of' in class_def and class_def['subclass_of']:
+                parent = class_def['subclass_of']
+                # Get parent URI
+                if parent in ontology_subset.classes:
+                    parent_class_def = ontology_subset.classes[parent]
+                    if isinstance(parent_class_def, dict) and 'uri' in parent_class_def and parent_class_def['uri']:
+                        parent_uri = parent_class_def['uri']
+                    else:
+                        parent_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{parent}"
+                else:
+                    parent_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{parent}"
+
+                ontology_triples.append(Triple(
+                    s=make_term(class_uri, is_uri=True),
+                    p=make_term("http://www.w3.org/2000/01/rdf-schema#subClassOf", is_uri=True),
+                    o=make_term(parent_uri, is_uri=True)
+                ))
+
+        # Generate triples for object properties
+        for prop_id, prop_def in ontology_subset.object_properties.items():
+            # Get URI for property
+            if isinstance(prop_def, dict) and 'uri' in prop_def and prop_def['uri']:
+                prop_uri = prop_def['uri']
+            else:
+                prop_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{prop_id}"
+
+            # rdf:type owl:ObjectProperty
+            ontology_triples.append(Triple(
+                s=make_term(prop_uri, is_uri=True),
+                p=make_term("http://www.w3.org/1999/02/22-rdf-syntax-ns#type", is_uri=True),
+                o=make_term("http://www.w3.org/2002/07/owl#ObjectProperty", is_uri=True)
+            ))
+
+            # rdfs:label (stored as 'labels' in OntologyProperty.__dict__)
+            if isinstance(prop_def, dict) and 'labels' in prop_def:
+                labels = prop_def['labels']
+                if isinstance(labels, list) and labels:
+                    label_val = labels[0].get('value', prop_id) if isinstance(labels[0], dict) else str(labels[0])
+                    ontology_triples.append(Triple(
+                        s=make_term(prop_uri, is_uri=True),
+                        p=make_term(RDF_LABEL, is_uri=True),
+                        o=make_term(label_val, is_uri=False)
+                    ))
+
+            # rdfs:comment (stored as 'comment' in OntologyProperty.__dict__)
+            if isinstance(prop_def, dict) and 'comment' in prop_def and prop_def['comment']:
+                comment = prop_def['comment']
+                ontology_triples.append(Triple(
+                    s=make_term(prop_uri, is_uri=True),
+                    p=make_term("http://www.w3.org/2000/01/rdf-schema#comment", is_uri=True),
+                    o=make_term(comment, is_uri=False)
+                ))
+
+            # rdfs:domain (stored as 'domain' in OntologyProperty.__dict__)
+            if isinstance(prop_def, dict) and 'domain' in prop_def and prop_def['domain']:
+                domain = prop_def['domain']
+                # Get domain class URI
+                if domain in ontology_subset.classes:
+                    domain_class_def = ontology_subset.classes[domain]
+                    if isinstance(domain_class_def, dict) and 'uri' in domain_class_def and domain_class_def['uri']:
+                        domain_uri = domain_class_def['uri']
+                    else:
+                        domain_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{domain}"
+                else:
+                    domain_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{domain}"
+
+                ontology_triples.append(Triple(
+                    s=make_term(prop_uri, is_uri=True),
+                    p=make_term("http://www.w3.org/2000/01/rdf-schema#domain", is_uri=True),
+                    o=make_term(domain_uri, is_uri=True)
+                ))
+
+            # rdfs:range (stored as 'range' in OntologyProperty.__dict__)
+            if isinstance(prop_def, dict) and 'range' in prop_def and prop_def['range']:
+                range_val = prop_def['range']
+                # Get range class URI
+                if range_val in ontology_subset.classes:
+                    range_class_def = ontology_subset.classes[range_val]
+                    if isinstance(range_class_def, dict) and 'uri' in range_class_def and range_class_def['uri']:
+                        range_uri = range_class_def['uri']
+                    else:
+                        range_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{range_val}"
+                else:
+                    range_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{range_val}"
+
+                ontology_triples.append(Triple(
+                    s=make_term(prop_uri, is_uri=True),
+                    p=make_term("http://www.w3.org/2000/01/rdf-schema#range", is_uri=True),
+                    o=make_term(range_uri, is_uri=True)
+                ))
+
+        # Generate triples for datatype properties
+        for prop_id, prop_def in ontology_subset.datatype_properties.items():
+            # Get URI for property
+            if isinstance(prop_def, dict) and 'uri' in prop_def and prop_def['uri']:
+                prop_uri = prop_def['uri']
+            else:
+                prop_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{prop_id}"
+
+            # rdf:type owl:DatatypeProperty
+            ontology_triples.append(Triple(
+                s=make_term(prop_uri, is_uri=True),
+                p=make_term("http://www.w3.org/1999/02/22-rdf-syntax-ns#type", is_uri=True),
+                o=make_term("http://www.w3.org/2002/07/owl#DatatypeProperty", is_uri=True)
+            ))
+
+            # rdfs:label (stored as 'labels' in OntologyProperty.__dict__)
+            if isinstance(prop_def, dict) and 'labels' in prop_def:
+                labels = prop_def['labels']
+                if isinstance(labels, list) and labels:
+                    label_val = labels[0].get('value', prop_id) if isinstance(labels[0], dict) else str(labels[0])
+                    ontology_triples.append(Triple(
+                        s=make_term(prop_uri, is_uri=True),
+                        p=make_term(RDF_LABEL, is_uri=True),
+                        o=make_term(label_val, is_uri=False)
+                    ))
+
+            # rdfs:comment (stored as 'comment' in OntologyProperty.__dict__)
+            if isinstance(prop_def, dict) and 'comment' in prop_def and prop_def['comment']:
+                comment = prop_def['comment']
+                ontology_triples.append(Triple(
+                    s=make_term(prop_uri, is_uri=True),
+                    p=make_term("http://www.w3.org/2000/01/rdf-schema#comment", is_uri=True),
+                    o=make_term(comment, is_uri=False)
+                ))
+
+            # rdfs:domain (stored as 'domain' in OntologyProperty.__dict__)
+            if isinstance(prop_def, dict) and 'domain' in prop_def and prop_def['domain']:
+                domain = prop_def['domain']
+                # Get domain class URI
+                if domain in ontology_subset.classes:
+                    domain_class_def = ontology_subset.classes[domain]
+                    if isinstance(domain_class_def, dict) and 'uri' in domain_class_def and domain_class_def['uri']:
+                        domain_uri = domain_class_def['uri']
+                    else:
+                        domain_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{domain}"
+                else:
+                    domain_uri = f"https://graphit.ai/ontology/{ontology_subset.ontology_id}#{domain}"
+
+                ontology_triples.append(Triple(
+                    s=make_term(prop_uri, is_uri=True),
+                    p=make_term("http://www.w3.org/2000/01/rdf-schema#domain", is_uri=True),
+                    o=make_term(domain_uri, is_uri=True)
+                ))
+
+            # rdfs:range (datatype)
+            if isinstance(prop_def, dict) and 'rdfs:range' in prop_def and prop_def['rdfs:range']:
+                range_val = prop_def['rdfs:range']
+                # Range for datatype properties is usually xsd:string, xsd:int, etc.
+                if range_val.startswith('xsd:'):
+                    range_uri = f"http://www.w3.org/2001/XMLSchema#{range_val[4:]}"
+                else:
+                    range_uri = range_val
+
+                ontology_triples.append(Triple(
+                    s=make_term(prop_uri, is_uri=True),
+                    p=make_term("http://www.w3.org/2000/01/rdf-schema#range", is_uri=True),
+                    o=make_term(range_uri, is_uri=True)
+                ))
+
+        logger.info(f"Generated {len(ontology_triples)} triples describing ontology elements")
+        return ontology_triples
+
+    def build_entity_contexts(self, triples: List[Triple]) -> List[EntityContext]:
+        """Build entity contexts from extracted triples.
+
+        Collects rdfs:label and definition properties for each entity to create
+        contextual descriptions for embedding.
+
+        Args:
+            triples: List of extracted triples
+
+        Returns:
+            List of EntityContext objects
+        """
+        # Group triples by subject to collect entity information
+        entity_data = {}  # subject_uri -> {labels: [], definitions: []}
+
+        for triple in triples:
+            subject_uri = triple.s.iri if triple.s.type == IRI else triple.s.value
+            predicate_uri = triple.p.iri if triple.p.type == IRI else triple.p.value
+            object_val = triple.o.value if triple.o.type == LITERAL else triple.o.iri
+
+            # Initialize entity data if not exists
+            if subject_uri not in entity_data:
+                entity_data[subject_uri] = {'labels': [], 'definitions': []}
+
+            # Collect labels (rdfs:label)
+            if predicate_uri == RDF_LABEL:
+                if triple.o.type == LITERAL:  # Labels are literals
+                    entity_data[subject_uri]['labels'].append(object_val)
+
+            # Collect definitions (skos:definition, schema:description)
+            elif predicate_uri == DEFINITION or predicate_uri == "https://schema.org/description":
+                if triple.o.type == LITERAL:
+                    entity_data[subject_uri]['definitions'].append(object_val)
+
+        # Build EntityContext objects
+        entity_contexts = []
+        for subject_uri, data in entity_data.items():
+            # Build context text from labels and definitions
+            context_parts = []
+
+            if data['labels']:
+                context_parts.append(f"Label: {data['labels'][0]}")
+
+            if data['definitions']:
+                context_parts.extend(data['definitions'])
+
+            # Only create EntityContext if we have meaningful context
+            if context_parts:
+                context_text = ". ".join(context_parts)
+                entity_contexts.append(EntityContext(
+                    entity=make_term(subject_uri, is_uri=True),
+                    context=context_text
+                ))
+
+        logger.debug(f"Built {len(entity_contexts)} entity contexts from {len(triples)} triples")
+        return entity_contexts
+
+    @staticmethod
+    def add_args(parser):
+        """Add command-line arguments."""
+        parser.add_argument(
+            '-c', '--concurrency',
+            type=int,
+            default=default_concurrency,
+            help=f'Concurrent processing threads (default: {default_concurrency})'
+        )
+        parser.add_argument(
+            '--top-k',
+            type=int,
+            default=10,
+            help='Number of top ontology elements to retrieve (default: 10)'
+        )
+        parser.add_argument(
+            '--similarity-threshold',
+            type=float,
+            default=0.3,
+            help='Similarity threshold for ontology matching (default: 0.3, range: 0.0-1.0)'
+        )
+        parser.add_argument(
+            '--bypass-selector-below',
+            type=int,
+            default=5,
+            help='Bypass ontology selector when total ontology elements '
+                 '(classes + properties) is below this value (default: 5)'
+        )
+        parser.add_argument(
+            '--triples-batch-size',
+            type=int,
+            default=default_triples_batch_size,
+            help=f'Maximum triples per output message (default: {default_triples_batch_size})'
+        )
+        parser.add_argument(
+            '--entity-batch-size',
+            type=int,
+            default=default_entity_batch_size,
+            help=f'Maximum entity contexts per output message (default: {default_entity_batch_size})'
+        )
+        FlowProcessor.add_args(parser)
+
+
+def run():
+    """Launch the OntoRAG extraction service."""
+    Processor.launch(default_ident, __doc__)

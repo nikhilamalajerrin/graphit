@@ -1,0 +1,196 @@
+
+import asyncio
+from aiohttp import web, WSMsgType
+import logging
+
+from .. running import Running
+from .. capabilities import (
+    PUBLIC, AUTHENTICATED, auth_failure,
+)
+
+logger = logging.getLogger("socket")
+logger.setLevel(logging.INFO)
+
+class SocketEndpoint:
+
+    def __init__(
+            self, endpoint_path, auth, dispatcher, capability,
+            in_band_auth=False,
+    ):
+        """
+        ``in_band_auth=True`` skips the handshake-time auth check.
+        The WebSocket handshake always succeeds; the dispatcher is
+        expected to gate itself via the first-frame auth protocol
+        (see ``Mux``).
+
+        This avoids the browser problem where a 401 on the handshake
+        is treated as permanent and prevents reconnection, and lets
+        long-lived sockets refresh their credential mid-session by
+        sending a new auth frame.
+        """
+
+        self.path = endpoint_path
+        self.auth = auth
+        self.capability = capability
+        self.in_band_auth = in_band_auth
+
+        self.dispatcher = dispatcher
+
+    async def worker(self, ws, dispatcher, running):
+
+        await dispatcher.run()
+
+    async def listener(self, ws, dispatcher, running):
+        """Enhanced listener with graceful shutdown"""
+        try:
+            async for msg in ws:
+                # On error, finish
+                if msg.type == WSMsgType.TEXT:
+                    await dispatcher.receive(msg)
+                    continue
+                elif msg.type == WSMsgType.BINARY:
+                    await dispatcher.receive(msg)
+                    continue
+                else:
+                    # Graceful shutdown on close
+                    logger.info("Websocket closing, initiating graceful shutdown")
+                    running.stop()
+                    
+                    # Allow time for dispatcher cleanup
+                    await asyncio.sleep(1.0)
+                    
+                    # Close websocket if not already closed
+                    if not ws.closed:
+                        await ws.close()
+                    break
+            else:
+                # This executes when the async for loop completes normally (no break)
+                logger.debug("Websocket iteration completed, performing cleanup")
+                running.stop()
+                if not ws.closed:
+                    await ws.close()
+        except Exception:
+            # Handle exceptions and cleanup
+            running.stop()
+            if not ws.closed:
+                await ws.close()
+            raise
+        
+    async def handle(self, request):
+        """Enhanced handler with better cleanup.
+
+        Auth: WebSocket clients pass the bearer token on the
+        ``?token=...`` query string; we wrap it into a synthetic
+        Authorization header before delegating to the standard auth
+        path so the IAM-backed flow (JWT / API key) applies uniformly.
+        The first-frame auth protocol described in the IAM spec is
+        a future upgrade."""
+
+        if not self.in_band_auth and self.capability != PUBLIC:
+            token = request.query.get("token", "")
+            if not token:
+                return auth_failure()
+            try:
+                identity = await self.auth.authenticate(
+                    _QueryTokenRequest(token)
+                )
+            except web.HTTPException as e:
+                return e
+            if self.capability != AUTHENTICATED:
+                try:
+                    await self.auth.authorise(
+                        identity, self.capability, {}, {},
+                    )
+                except web.HTTPException as e:
+                    return e
+
+        # 50MB max message size
+        ws = web.WebSocketResponse(max_msg_size=52428800)
+
+        await ws.prepare(request)
+        
+        dispatcher = None
+        
+        try:
+
+            async with asyncio.TaskGroup() as tg:
+
+                running = Running()
+
+                params = dict(request.query)
+                params.update(request.match_info)
+                dispatcher = await self.dispatcher(
+                    ws, running, params
+                )
+
+                worker_task = tg.create_task(
+                    self.worker(ws, dispatcher, running)
+                )
+
+                lsnr_task = tg.create_task(
+                    self.listener(ws, dispatcher, running)
+                )
+
+                logger.debug("Created task group, waiting for completion...")
+
+                # Wait for threads to complete
+
+            logger.debug("Task group closed")
+
+        except ExceptionGroup as e:
+
+            logger.error("Exception group occurred:", exc_info=True)
+
+            for se in e.exceptions:
+                logger.error(f"  Exception type: {type(se)}")
+                logger.error(f"  Exception: {se}")
+                
+            # Attempt graceful dispatcher shutdown
+            if dispatcher and hasattr(dispatcher, 'destroy'):
+                try:
+                    await asyncio.wait_for(
+                        dispatcher.destroy(), 
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Dispatcher shutdown timed out")
+                except Exception as de:
+                    logger.error(f"Error during dispatcher cleanup: {de}")
+                    
+        except Exception as e:
+            logger.error(f"Socket exception: {e}", exc_info=True)
+            
+        finally:
+            # Ensure dispatcher cleanup
+            if dispatcher and hasattr(dispatcher, 'destroy'):
+                try:
+                    await dispatcher.destroy()
+                except Exception as de:
+                    logger.error(f"Error in final dispatcher cleanup: {de}")
+                    
+            # Ensure websocket is closed
+            if ws and not ws.closed:
+                await ws.close()
+                
+        return ws
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        self.running.stop()
+
+    def add_routes(self, app):
+
+        app.add_routes([
+            web.get(self.path, self.handle),
+        ])
+
+
+class _QueryTokenRequest:
+    """Minimal shim that exposes headers["Authorization"] to
+    IamAuth.authenticate(), derived from a query-string token."""
+
+    def __init__(self, token):
+        self.headers = {"Authorization": f"Bearer {token}"}
+

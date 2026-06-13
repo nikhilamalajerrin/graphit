@@ -1,0 +1,167 @@
+
+"""
+Accepts entity/vector pairs and writes them to a Qdrant store.
+"""
+
+import asyncio
+import uuid
+import logging
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+from qdrant_client.models import Distance, VectorParams
+
+from .... base import DocumentEmbeddingsStoreService, CollectionConfigHandler
+from .... base import AsyncProcessor, Consumer, Producer
+from .... base import ConsumerMetrics, ProducerMetrics
+from .... base.qdrant_config import add_qdrant_args, resolve_qdrant_config
+
+# Module logger
+logger = logging.getLogger(__name__)
+
+default_ident = "doc-embeddings-write"
+
+class Processor(CollectionConfigHandler, DocumentEmbeddingsStoreService):
+
+    def __init__(self, **params):
+
+        store_uri = params.get("store_uri")
+        api_key = params.get("api_key")
+
+        url, api_key, replication_factor, shard_number = resolve_qdrant_config(
+            url=store_uri, api_key=api_key,
+            replication_factor=params.get("qdrant_replication_factor"),
+            shard_number=params.get("qdrant_shard_number"),
+        )
+
+        super(Processor, self).__init__(
+            **params | {
+                "store_uri": url,
+                "api_key": api_key,
+            }
+        )
+
+        self.qdrant = QdrantClient(url=url, api_key=api_key)
+        self.replication_factor = replication_factor
+        self.shard_number = shard_number
+        self._cache_lock = asyncio.Lock()
+        self._known_collections: set[str] = set()
+
+        # Register for config push notifications
+        self.register_config_handler(self.on_collection_config, types=["collection"])
+
+    async def ensure_collection(self, collection_name, dim):
+        async with self._cache_lock:
+            if collection_name in self._known_collections:
+                return
+            exists = await asyncio.to_thread(
+                self.qdrant.collection_exists, collection_name
+            )
+            if not exists:
+                logger.info(
+                    f"Lazily creating Qdrant collection {collection_name} "
+                    f"with dimension {dim}"
+                )
+                await asyncio.to_thread(
+                    self.qdrant.create_collection,
+                    collection_name=collection_name,
+                    vectors_config=VectorParams(
+                        size=dim, distance=Distance.COSINE
+                    ),
+                    replication_factor=self.replication_factor,
+                    shard_number=self.shard_number,
+                )
+            self._known_collections.add(collection_name)
+
+    async def store_document_embeddings(self, workspace, message):
+
+        if not self.collection_exists(workspace, message.metadata.collection):
+            logger.warning(
+                f"Collection {message.metadata.collection} for workspace {workspace} "
+                f"does not exist in config (likely deleted while data was in-flight). "
+                f"Dropping message."
+            )
+            return
+
+        for emb in message.chunks:
+
+            chunk_id = emb.chunk_id
+            if chunk_id == "":
+                continue
+
+            vec = emb.vector
+            if not vec:
+                continue
+
+            dim = len(vec)
+            collection = (
+                f"d_{workspace}_{message.metadata.collection}_{dim}"
+            )
+
+            await self.ensure_collection(collection, dim)
+
+            await asyncio.to_thread(
+                self.qdrant.upsert,
+                collection_name=collection,
+                points=[
+                    PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=vec,
+                        payload={
+                            "chunk_id": chunk_id,
+                        }
+                    )
+                ],
+            )
+
+    @staticmethod
+    def add_args(parser):
+
+        DocumentEmbeddingsStoreService.add_args(parser)
+        add_qdrant_args(parser)
+
+    async def create_collection(self, workspace: str, collection: str, metadata: dict):
+        """
+        Create collection via config push - collections are created lazily on first write
+        with the correct dimension determined from the actual embeddings.
+        """
+        try:
+            logger.info(f"Collection create request for {workspace}/{collection} - will be created lazily on first write")
+
+        except Exception as e:
+            logger.error(f"Failed to create collection {workspace}/{collection}: {e}", exc_info=True)
+            raise
+
+    async def delete_collection(self, workspace: str, collection: str):
+        """Delete the collection for document embeddings via config push"""
+        try:
+            prefix = f"d_{workspace}_{collection}_"
+
+            all_collections = await asyncio.to_thread(
+                lambda: self.qdrant.get_collections().collections
+            )
+            matching_collections = [
+                coll.name for coll in all_collections
+                if coll.name.startswith(prefix)
+            ]
+
+            if not matching_collections:
+                logger.info(f"No collections found matching prefix {prefix}")
+            else:
+                for collection_name in matching_collections:
+                    await asyncio.to_thread(
+                        self.qdrant.delete_collection, collection_name
+                    )
+                    async with self._cache_lock:
+                        self._known_collections.discard(collection_name)
+                    logger.info(f"Deleted Qdrant collection: {collection_name}")
+                logger.info(f"Deleted {len(matching_collections)} collection(s) for {workspace}/{collection}")
+
+        except Exception as e:
+            logger.error(f"Failed to delete collection {workspace}/{collection}: {e}", exc_info=True)
+            raise
+
+def run():
+
+    Processor.launch(default_ident, __doc__)
+
