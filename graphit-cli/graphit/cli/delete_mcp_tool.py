@@ -1,0 +1,111 @@
+"""
+Deletes MCP (Model Control Protocol) tools from the GraphIt system.
+Removes MCP tool configurations by ID from the 'mcp' configuration group.
+"""
+
+import argparse
+import os
+from graphit.api import Api, ConfigKey
+import textwrap
+
+default_url = os.getenv("GRAPHIT_URL", 'http://localhost:8088/')
+
+default_token = os.getenv("GRAPHIT_TOKEN", None)
+default_workspace = os.getenv("GRAPHIT_WORKSPACE", "default")
+def delete_mcp_tool(
+        url : str,
+        id : str,
+        token=None,
+        workspace="default",
+):
+
+    api = Api(url, token=token, workspace=workspace).config()
+
+    # Check if the tool exists first
+    try:
+        values = api.get([
+            ConfigKey(type="mcp", key=id)
+        ])
+        
+        if not values or not values[0].value:
+            print(f"MCP tool '{id}' not found.")
+            return False
+            
+    except Exception as e:
+        print(f"MCP tool '{id}' not found.")
+        return False
+
+    # Delete the MCP tool configuration from the 'mcp' group
+    try:
+        api.delete([
+            ConfigKey(type="mcp", key=id)
+        ])
+        
+        print(f"MCP tool '{id}' deleted successfully.")
+        return True
+        
+    except Exception as e:
+        print(f"Error deleting MCP tool '{id}': {e}")
+        return False
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        prog='gr-delete-mcp-tool',
+        description=__doc__,
+        epilog=textwrap.dedent('''
+            This utility removes MCP tool configurations from the GraphIt system.
+            Once deleted, the tool will no longer be available for use.
+            
+            Examples:
+              %(prog)s --id weather
+              %(prog)s --id calculator
+              %(prog)s --api-url http://localhost:9000/ --id file-reader
+        ''').strip(),
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        '-u', '--api-url',
+        default=default_url,
+        help=f'API URL (default: {default_url})',
+    )
+
+    parser.add_argument(
+        '--id',
+        required=True,
+        help='MCP tool ID to delete',
+    )
+
+    parser.add_argument(
+        '-t', '--token',
+        default=default_token,
+        help='Authentication token (default: $GRAPHIT_TOKEN)',
+    )
+
+    parser.add_argument(
+        '-w', '--workspace',
+        default=default_workspace,
+        help=f'Workspace (default: {default_workspace})',
+    )
+
+    args = parser.parse_args()
+
+    try:
+
+        if not args.id:
+            raise RuntimeError("Must specify --id for MCP tool to delete")
+
+        delete_mcp_tool(
+            url=args.api_url,
+            id=args.id,
+            token=args.token,
+            workspace=args.workspace,
+        )
+
+    except Exception as e:
+
+        print("Exception:", e, flush=True)
+
+if __name__ == "__main__":
+    main()

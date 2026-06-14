@@ -1,0 +1,95 @@
+"""
+Gets a specific configuration item
+"""
+
+import argparse
+import os
+import json
+from graphit.api import Api
+from graphit.api.types import ConfigKey
+
+default_url = os.getenv("GRAPHIT_URL", 'http://localhost:8088/')
+default_token = os.getenv("GRAPHIT_TOKEN", None)
+default_workspace = os.getenv("GRAPHIT_WORKSPACE", "default")
+
+def get_config_item(url, config_type, key, format_type, token=None,
+                    workspace="default"):
+
+    api = Api(url, token=token, workspace=workspace).config()
+
+    config_key = ConfigKey(type=config_type, key=key)
+    values = api.get([config_key])
+
+    if not values:
+        raise Exception(f"Configuration item not found: {config_type}/{key}")
+
+    value = values[0].value
+
+    if format_type == "json":
+        print(json.dumps(value))
+    else:
+        print(value)
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        prog='gr-get-config-item',
+        description=__doc__,
+    )
+
+    parser.add_argument(
+        '--type',
+        required=True,
+        help='Configuration type',
+    )
+
+    parser.add_argument(
+        '--key',
+        required=True,
+        help='Configuration key',
+    )
+
+    parser.add_argument(
+        '--format',
+        choices=['text', 'json'],
+        default='text',
+        help='Output format (default: text)',
+    )
+
+    parser.add_argument(
+        '-u', '--api-url',
+        default=default_url,
+        help=f'API URL (default: {default_url})',
+    )
+
+    parser.add_argument(
+        '-t', '--token',
+        default=default_token,
+        help='Authentication token (default: $GRAPHIT_TOKEN)',
+    )
+
+    parser.add_argument(
+        '-w', '--workspace',
+        default=default_workspace,
+        help=f'Workspace (default: {default_workspace})',
+    )
+
+    args = parser.parse_args()
+
+    try:
+
+        get_config_item(
+            url=args.api_url,
+            config_type=args.type,
+            key=args.key,
+            format_type=args.format,
+            token=args.token,
+            workspace=args.workspace,
+        )
+
+    except Exception as e:
+
+        print("Exception:", e, flush=True)
+
+if __name__ == "__main__":
+    main()

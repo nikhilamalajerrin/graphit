@@ -1,0 +1,133 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphit-cli"
+dynamic = ["version"]
+authors = [{name = "graphit.ai", email = "security@graphit.ai"}]
+description = "GraphIt provides a means to run a pipeline of flexible AI processing components in a flexible means to achieve a processing pipeline."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "graphit-base>=2.5,<2.6",
+    "requests",
+    "pulsar-client",
+    "aiohttp",
+    "rdflib",
+    "tabulate",
+    "msgpack",
+    "websockets",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/graphit-ai/graphit"
+
+[project.scripts]
+gr-add-library-document = "graphit.cli.add_library_document:main"
+gr-delete-flow-blueprint = "graphit.cli.delete_flow_blueprint:main"
+gr-delete-mcp-tool = "graphit.cli.delete_mcp_tool:main"
+gr-delete-kg-core = "graphit.cli.delete_kg_core:main"
+gr-delete-tool = "graphit.cli.delete_tool:main"
+gr-dump-msgpack = "graphit.cli.dump_msgpack:main"
+gr-dump-queues = "graphit.cli.dump_queues:main"
+gr-monitor-prompts = "graphit.cli.monitor_prompts:main"
+gr-get-flow-blueprint = "graphit.cli.get_flow_blueprint:main"
+gr-get-de-core = "graphit.cli.get_de_core:main"
+gr-get-kg-core = "graphit.cli.get_kg_core:main"
+gr-get-document-content = "graphit.cli.get_document_content:main"
+gr-graph-to-turtle = "graphit.cli.graph_to_turtle:main"
+gr-bootstrap-iam = "graphit.cli.bootstrap_iam:main"
+gr-login = "graphit.cli.login:main"
+gr-create-user = "graphit.cli.create_user:main"
+gr-list-users = "graphit.cli.list_users:main"
+gr-whoami = "graphit.cli.whoami:main"
+gr-update-user = "graphit.cli.update_user:main"
+gr-disable-user = "graphit.cli.disable_user:main"
+gr-enable-user = "graphit.cli.enable_user:main"
+gr-delete-user = "graphit.cli.delete_user:main"
+gr-change-password = "graphit.cli.change_password:main"
+gr-reset-password = "graphit.cli.reset_password:main"
+gr-create-api-key = "graphit.cli.create_api_key:main"
+gr-list-api-keys = "graphit.cli.list_api_keys:main"
+gr-revoke-api-key = "graphit.cli.revoke_api_key:main"
+gr-list-workspaces = "graphit.cli.list_workspaces:main"
+gr-list-my-workspaces = "graphit.cli.list_my_workspaces:main"
+gr-create-workspace = "graphit.cli.create_workspace:main"
+gr-invoke-agent = "graphit.cli.invoke_agent:main"
+gr-invoke-document-rag = "graphit.cli.invoke_document_rag:main"
+gr-invoke-graph-rag = "graphit.cli.invoke_graph_rag:main"
+gr-invoke-llm = "graphit.cli.invoke_llm:main"
+gr-invoke-embeddings = "graphit.cli.invoke_embeddings:main"
+gr-invoke-graph-embeddings = "graphit.cli.invoke_graph_embeddings:main"
+gr-invoke-document-embeddings = "graphit.cli.invoke_document_embeddings:main"
+gr-invoke-mcp-tool = "graphit.cli.invoke_mcp_tool:main"
+gr-invoke-nlp-query = "graphit.cli.invoke_nlp_query:main"
+gr-invoke-rows-query = "graphit.cli.invoke_rows_query:main"
+gr-invoke-sparql-query = "graphit.cli.invoke_sparql_query:main"
+gr-invoke-row-embeddings = "graphit.cli.invoke_row_embeddings:main"
+gr-invoke-prompt = "graphit.cli.invoke_prompt:main"
+gr-invoke-structured-query = "graphit.cli.invoke_structured_query:main"
+gr-load-doc-embeds = "graphit.cli.load_doc_embeds:main"
+gr-load-kg-core = "graphit.cli.load_kg_core:main"
+gr-load-sample-documents = "graphit.cli.load_sample_documents:main"
+gr-load-turtle = "graphit.cli.load_turtle:main"
+gr-load-knowledge = "graphit.cli.load_knowledge:main"
+gr-load-obsidian-vault = "graphit.cli.load_obsidian_vault:main"
+gr-load-structured-data = "graphit.cli.load_structured_data:main"
+gr-put-flow-blueprint = "graphit.cli.put_flow_blueprint:main"
+gr-put-de-core = "graphit.cli.put_de_core:main"
+gr-put-kg-core = "graphit.cli.put_kg_core:main"
+gr-remove-library-document = "graphit.cli.remove_library_document:main"
+gr-save-doc-embeds = "graphit.cli.save_doc_embeds:main"
+gr-set-mcp-tool = "graphit.cli.set_mcp_tool:main"
+gr-set-prompt = "graphit.cli.set_prompt:main"
+gr-set-token-costs = "graphit.cli.set_token_costs:main"
+gr-set-tool = "graphit.cli.set_tool:main"
+gr-show-config = "graphit.cli.show_config:main"
+gr-show-flow-blueprints = "graphit.cli.show_flow_blueprints:main"
+gr-show-flow-state = "graphit.cli.show_flow_state:main"
+gr-show-flows = "graphit.cli.show_flows:main"
+gr-query-graph = "graphit.cli.query_graph:main"
+gr-show-graph = "graphit.cli.show_graph:main"
+gr-show-kg-cores = "graphit.cli.show_kg_cores:main"
+gr-show-library-documents = "graphit.cli.show_library_documents:main"
+gr-show-library-processing = "graphit.cli.show_library_processing:main"
+gr-show-mcp-tools = "graphit.cli.show_mcp_tools:main"
+gr-show-parameter-types = "graphit.cli.show_parameter_types:main"
+gr-show-processor-state = "graphit.cli.show_processor_state:main"
+gr-show-prompts = "graphit.cli.show_prompts:main"
+gr-show-token-costs = "graphit.cli.show_token_costs:main"
+gr-show-token-rate = "graphit.cli.show_token_rate:main"
+gr-show-tools = "graphit.cli.show_tools:main"
+gr-start-flow = "graphit.cli.start_flow:main"
+gr-unload-kg-core = "graphit.cli.unload_kg_core:main"
+gr-start-library-processing = "graphit.cli.start_library_processing:main"
+gr-stop-flow = "graphit.cli.stop_flow:main"
+gr-stop-library-processing = "graphit.cli.stop_library_processing:main"
+gr-verify-system-status = "graphit.cli.verify_system_status:main"
+gr-list-config-items = "graphit.cli.list_config_items:main"
+gr-get-config-item = "graphit.cli.get_config_item:main"
+gr-put-config-item = "graphit.cli.put_config_item:main"
+gr-delete-config-item = "graphit.cli.delete_config_item:main"
+gr-export-workspace-config = "graphit.cli.export_workspace_config:main"
+gr-import-workspace-config = "graphit.cli.import_workspace_config:main"
+gr-list-collections = "graphit.cli.list_collections:main"
+gr-set-collection = "graphit.cli.set_collection:main"
+gr-delete-collection = "graphit.cli.delete_collection:main"
+gr-show-extraction-provenance = "graphit.cli.show_extraction_provenance:main"
+gr-list-explain-traces = "graphit.cli.list_explain_traces:main"
+gr-show-explain-trace = "graphit.cli.show_explain_trace:main"
+
+[tool.setuptools.package-data]
+"graphit.cli.sample_documents" = ["*.md", "*.pdf", "*.json"]
+
+[tool.setuptools.packages.find]
+include = ["graphit*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "graphit.cli_version.__version__"}
