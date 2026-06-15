@@ -1,0 +1,191 @@
+openapi: 3.1.0
+
+info:
+  title: GraphIt API Gateway
+  version: "2.4"
+  description: |
+    REST API for GraphIt - an AI-powered knowledge graph and RAG system.
+
+    ## Overview
+
+    The API provides access to:
+    - **Global Services**: IAM (user management, authentication)
+    - **Workspace-Scoped Services**: Configuration, flow management, knowledge storage, library management
+    - **Flow-Scoped Services**: AI services like RAG, text completion, embeddings (require running flow)
+    - **Import/Export**: Bulk data operations for triples, embeddings, entity contexts
+    - **WebSocket**: Multiplexed interface for all services
+
+    ## Authentication
+
+    Clients authenticate by passing an opaque bearer token in the
+    `Authorization` header.  The token is obtained via the IAM service
+    (e.g. `gr-login` or `gr-create-api-key`).
+
+    ```
+    Authorization: Bearer <token>
+    ```
+
+    The gateway resolves the token to an authenticated identity and an
+    associated workspace.  The token is an opaque string — clients must
+    not make assumptions about its internal structure.
+
+    ## Service Tiers
+
+    ### Global Services
+    System-wide services with no workspace scoping:
+    - `iam` - User management, authentication, API key lifecycle
+
+    ### Workspace-Scoped Services
+    Operate within the workspace associated with the authenticated
+    token.  The workspace is resolved by the gateway — it is not
+    passed as an explicit parameter.
+
+    Fixed endpoints accessible via `/api/v1/{kind}`:
+    - `config` - Configuration management
+    - `flow` - Flow lifecycle and blueprints
+    - `librarian` - Document library management
+    - `knowledge` - Knowledge graph core management
+    - `collection-management` - Collection metadata
+
+    ### Flow-Scoped Services
+    Require a `flow` parameter identifying the processing flow to use.
+    Workspace context comes from the authenticated token.
+
+    Accessed via `/api/v1/flow/{flow}/service/{kind}`:
+    - AI services: agent, text-completion, prompt, RAG (document/graph)
+    - Embeddings: embeddings, graph-embeddings, document-embeddings
+    - Query: triples, rows, nlp-query, structured-query, sparql-query, row-embeddings
+    - Data loading: text-load, document-load
+    - Utilities: mcp-tool, structured-diag
+
+    ## Field Naming
+
+    All JSON fields use **kebab-case**: `flow-id`, `blueprint-name`, `doc-limit`, etc.
+
+    ## Error Responses
+
+    All endpoints may return errors in this format:
+    ```json
+    {
+      "error": {
+        "type": "gateway-error",
+        "message": "Timeout"
+      }
+    }
+    ```
+
+  contact:
+    name: GraphIt Project
+    url: https://example.com
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: http://localhost:8088
+    description: Local development server
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: IAM
+    description: Identity and access management (global)
+  - name: Config
+    description: Configuration management (workspace-scoped)
+  - name: Flow
+    description: Flow lifecycle and blueprint management (workspace-scoped)
+  - name: Librarian
+    description: Document library management (workspace-scoped)
+  - name: Knowledge
+    description: Knowledge graph core management (workspace-scoped)
+  - name: Collection
+    description: Collection metadata management (workspace-scoped)
+  - name: Flow Services
+    description: AI and query services hosted within flow instances (flow-scoped)
+  - name: Import/Export
+    description: Bulk data import and export
+  - name: WebSocket
+    description: WebSocket interfaces
+  - name: Metrics
+    description: System metrics and monitoring
+
+paths:
+  # Global services
+  /api/v1/iam:
+    $ref: './paths/iam.yaml'
+
+  # Workspace-scoped services
+  /api/v1/config:
+    $ref: './paths/config.yaml'
+  /api/v1/flow:
+    $ref: './paths/flow.yaml'
+  /api/v1/librarian:
+    $ref: './paths/librarian.yaml'
+  /api/v1/knowledge:
+    $ref: './paths/knowledge.yaml'
+  /api/v1/collection-management:
+    $ref: './paths/collection-management.yaml'
+
+  # Flow-hosted services (require running flow instance)
+  /api/v1/flow/{flow}/service/agent:
+    $ref: './paths/flow/agent.yaml'
+  /api/v1/flow/{flow}/service/document-rag:
+    $ref: './paths/flow/document-rag.yaml'
+  /api/v1/flow/{flow}/service/graph-rag:
+    $ref: './paths/flow/graph-rag.yaml'
+  /api/v1/flow/{flow}/service/text-completion:
+    $ref: './paths/flow/text-completion.yaml'
+  /api/v1/flow/{flow}/service/prompt:
+    $ref: './paths/flow/prompt.yaml'
+  /api/v1/flow/{flow}/service/embeddings:
+    $ref: './paths/flow/embeddings.yaml'
+  /api/v1/flow/{flow}/service/mcp-tool:
+    $ref: './paths/flow/mcp-tool.yaml'
+  /api/v1/flow/{flow}/service/triples:
+    $ref: './paths/flow/triples.yaml'
+  /api/v1/flow/{flow}/service/rows:
+    $ref: './paths/flow/rows.yaml'
+  /api/v1/flow/{flow}/service/nlp-query:
+    $ref: './paths/flow/nlp-query.yaml'
+  /api/v1/flow/{flow}/service/structured-query:
+    $ref: './paths/flow/structured-query.yaml'
+  /api/v1/flow/{flow}/service/structured-diag:
+    $ref: './paths/flow/structured-diag.yaml'
+  /api/v1/flow/{flow}/service/graph-embeddings:
+    $ref: './paths/flow/graph-embeddings.yaml'
+  /api/v1/flow/{flow}/service/document-embeddings:
+    $ref: './paths/flow/document-embeddings.yaml'
+  /api/v1/flow/{flow}/service/row-embeddings:
+    $ref: './paths/flow/row-embeddings.yaml'
+  /api/v1/flow/{flow}/service/text-load:
+    $ref: './paths/flow/text-load.yaml'
+  /api/v1/flow/{flow}/service/document-load:
+    $ref: './paths/flow/document-load.yaml'
+  /api/v1/flow/{flow}/service/sparql-query:
+    $ref: './paths/flow/sparql-query.yaml'
+
+  # Document streaming
+  /api/v1/document-stream:
+    $ref: './paths/document-stream.yaml'
+
+  # Import/Export endpoints
+  /api/v1/import-core:
+    $ref: './paths/import-core.yaml'
+  /api/v1/export-core:
+    $ref: './paths/export-core.yaml'
+
+  # WebSocket endpoints
+  /api/v1/socket:
+    $ref: './paths/websocket.yaml'
+
+  # Metrics endpoint
+  /api/metrics:
+    $ref: './paths/metrics.yaml'
+  /api/metrics/{path}:
+    $ref: './paths/metrics-path.yaml'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      $ref: './security/bearerAuth.yaml'

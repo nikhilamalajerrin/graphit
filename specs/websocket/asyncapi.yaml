@@ -1,0 +1,104 @@
+asyncapi: 3.0.0
+
+info:
+  title: GraphIt WebSocket API
+  version: "2.4"
+  description: |
+    WebSocket API for GraphIt - providing multiplexed, asynchronous access to all services.
+
+    ## Overview
+
+    The WebSocket API provides access to all GraphIt services over a single persistent connection:
+    - **Multiplexed**: Multiple concurrent requests with ID-based correlation
+    - **Asynchronous**: Non-blocking request/response pattern
+    - **Efficient**: Lower overhead than HTTP REST
+    - **Streaming**: Real-time progressive responses
+
+    ## Authentication
+
+    The `/api/v1/socket` endpoint uses **in-band authentication**.
+    The WebSocket handshake is accepted unconditionally. The client
+    must authenticate by sending a bearer token as the first message
+    after connecting.  The gateway resolves the token to an
+    authenticated identity and workspace.
+
+    All subsequent requests execute within the workspace context
+    established by the authentication frame.
+
+    ## Protocol Summary
+
+    All messages are JSON with:
+    - `id`: Client-generated unique identifier for request/response correlation
+    - `service`: Service identifier (e.g., "config", "agent", "document-rag")
+    - `flow`: Optional flow ID for flow-scoped services
+    - `request`/`response`: Service-specific payload (identical to REST API schemas)
+    - `error`: Error information on failure
+
+    ## Service Tiers
+
+    **Global Services** (no workspace scoping):
+    - iam
+
+    **Workspace-Scoped Services** (workspace resolved from token):
+    - config, flow, librarian, knowledge, collection-management
+
+    **Flow-Scoped Services** (require `flow` parameter, workspace from token):
+    - agent, text-completion, prompt, document-rag, graph-rag
+    - embeddings, graph-embeddings, document-embeddings
+    - triples, rows, nlp-query, structured-query, sparql-query, structured-diag, row-embeddings
+    - text-load, document-load, mcp-tool
+
+    ## Schema Reuse
+
+    Request and response payloads use identical schemas to the REST API.
+    See OpenAPI specification for detailed schema documentation.
+
+  contact:
+    name: GraphIt Project
+    url: https://example.com
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  production:
+    host: localhost:8088
+    protocol: ws
+    description: Local development WebSocket server
+    security:
+      - $ref: '#/components/securitySchemes/bearerAuth'
+
+defaultContentType: application/json
+
+channels:
+  socket:
+    $ref: './channels/socket.yaml'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: httpApiKey
+      name: Authorization
+      in: header
+      description: |
+        Bearer token authentication.  The `/api/v1/socket` endpoint
+        uses in-band authentication: the WebSocket handshake is
+        accepted unconditionally and the client sends a bearer token
+        as the first frame after connecting.  The token is an opaque
+        string obtained via the IAM service.
+
+  messages:
+    ServiceRequest:
+      $ref: './components/messages/ServiceRequest.yaml'
+    ServiceResponse:
+      $ref: './components/messages/ServiceResponse.yaml'
+    ServiceError:
+      $ref: './components/messages/ServiceError.yaml'
+
+  schemas:
+    RequestEnvelope:
+      $ref: './components/schemas/RequestEnvelope.yaml'
+    ResponseEnvelope:
+      $ref: './components/schemas/ResponseEnvelope.yaml'
+    ErrorEnvelope:
+      $ref: './components/schemas/ErrorEnvelope.yaml'
